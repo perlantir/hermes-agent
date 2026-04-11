@@ -3,13 +3,36 @@
 Covers the full locked HTTP contract against the in-process mock
 HIPP0 (``tests/fixtures/mock_hipp0.py``), plus WAL + degraded-mode
 fallbacks exercised by forcing failures.
+
+Live mode
+---------
+Setting ``HIPP0_LIVE_URL`` in the environment replaces the in-process
+aiohttp mock with a real HIPP0 instance reachable at that URL. This is
+the H6 path — exercises the provider against a real HTTP server, real
+SQLite, real endpoint implementations. Used by the Tier 2 integration
+harness on the VPS.
+
+In live mode:
+  * ``project_id`` defaults to HIPP0's seeded demo project
+    ``de000000-0000-4000-8000-000000000001`` (override via
+    ``HIPP0_LIVE_PROJECT_ID``).
+  * Each provider is registered against HIPP0 before session/start so
+    the ``hermes_agents`` row exists.
+  * Tests that depend on mock-only knobs (``queue_failure`` for 5xx /
+    4xx injection, call-log introspection) are skipped because a real
+    server can't have failures injected and doesn't expose its request
+    log.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 import httpx
 import pytest
@@ -26,6 +49,68 @@ pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
+# Live mode plumbing
+# ---------------------------------------------------------------------------
+
+LIVE_URL = os.environ.get("HIPP0_LIVE_URL")
+LIVE_PROJECT_ID = os.environ.get(
+    "HIPP0_LIVE_PROJECT_ID",
+    "de000000-0000-4000-8000-000000000001",
+)
+
+
+def is_live() -> bool:
+    return LIVE_URL is not None
+
+
+def skip_if_mock_only(reason: str) -> None:
+    """Skip the current test when running in live mode."""
+    if is_live():
+        pytest.skip(reason)
+
+
+class _LiveHipp0Handle:
+    """MockHipp0 look-alike that proxies to a real HIPP0 instance.
+
+    A real server can't have failures injected and doesn't surface its
+    request log to the client. Tests that need those knobs are expected
+    to call :func:`skip_if_mock_only` or bail out when they hit
+    :meth:`queue_failure` / :meth:`last_call`. Tests that only need the
+    ``base_url`` work transparently.
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url
+
+    def last_call(self, path=None):  # type: ignore[no-untyped-def]
+        return None  # tests should gate on is_live() before asserting
+
+    def calls_for(self, path):  # type: ignore[no-untyped-def]
+        return []
+
+    def queue_failure(self, path, status, count=1):  # type: ignore[no-untyped-def]
+        pytest.skip(
+            "queue_failure requires the in-process mock HIPP0; "
+            "running against HIPP0_LIVE_URL"
+        )
+
+
+@asynccontextmanager
+async def _hipp0_endpoint() -> AsyncIterator[object]:
+    """Yield either a MockHipp0 (default) or a :class:`_LiveHipp0Handle`.
+
+    Tests call this via ``async with _hipp0_endpoint() as hipp0:`` so the
+    same test body exercises both the in-process mock and a real HIPP0
+    instance when ``HIPP0_LIVE_URL`` is set.
+    """
+    if is_live():
+        yield _LiveHipp0Handle(LIVE_URL)  # type: ignore[arg-type]
+    else:
+        async with start_mock_hipp0() as handle:
+            yield handle
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -36,20 +121,47 @@ async def _make_provider(
     *,
     agent_name: str = "alice",
 ) -> Hipp0MemoryProvider:
+    # In live mode, give every provider a unique agent_name suffix so the
+    # persistent SQLite db behind HIPP0 doesn't collide across test runs
+    # (agent_name is unique per project in HIPP0). Also swap in the demo
+    # project id that HIPP0 seeds on fresh boots.
+    if is_live():
+        unique_suffix = uuid.uuid4().hex[:8]
+        agent_name = f"{agent_name}-live-{unique_suffix}"
+        project_id = LIVE_PROJECT_ID
+    else:
+        project_id = "00000000-0000-0000-0000-000000000001"
+
     agent_dir = tmp_path / "agents" / agent_name
     agent_dir.mkdir(parents=True)
     (agent_dir / "MEMORY.md").write_text(
         "# Cached memory\n\nUser prefers phone calls.\n", encoding="utf-8"
     )
-    return Hipp0MemoryProvider(
+    provider = Hipp0MemoryProvider(
         base_url=base_url,
         api_key="test-key",
-        project_id="00000000-0000-0000-0000-000000000001",
+        project_id=project_id,
         agent_name=agent_name,
         agent_id="00000000-0000-0000-0000-000000000002",
         pending_wal_path=agent_dir / "pending.jsonl",
         memory_md_path=agent_dir / "MEMORY.md",
     )
+
+    # Session/start against live HIPP0 requires the agent row to already
+    # exist in hermes_agents — the mock doesn't care, but the real server
+    # returns 404. Register here so every happy-path test has a valid
+    # agent without each test having to call register itself.
+    if is_live():
+        await provider.register(
+            soul=f"# {agent_name}\n\nH6 live-smoke test agent.\n",
+            config={
+                "model": "anthropic/claude-opus-4.6",
+                "toolset": "default",
+                "platform_access": ["telegram", "cli"],
+            },
+        )
+
+    return provider
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +171,7 @@ async def _make_provider(
 
 class TestHappyPath:
     async def test_start_session_sets_session_id(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 session_id = await provider.start_session(
@@ -69,19 +181,20 @@ class TestHappyPath:
                 )
                 assert session_id
                 assert provider.session_id == session_id
-                call = hipp0.last_call("/api/hermes/session/start")
-                assert call is not None
-                assert call.body["project_id"] == provider.project_id
-                assert call.body["agent_name"] == "alice"
-                assert call.body["platform"] == "telegram"
-                assert call.body["user_id"] == "tg-42"
-                assert call.body["external_chat_id"] == "chat-7"
-                assert call.headers.get("Authorization") == "Bearer test-key"
+                if not is_live():
+                    call = hipp0.last_call("/api/hermes/session/start")
+                    assert call is not None
+                    assert call.body["project_id"] == provider.project_id
+                    assert call.body["agent_name"] == provider.agent_name
+                    assert call.body["platform"] == "telegram"
+                    assert call.body["external_user_id"] == "tg-42"
+                    assert call.body["external_chat_id"] == "chat-7"
+                    assert call.headers.get("Authorization") == "Bearer test-key"
             finally:
                 await provider.aclose()
 
     async def test_end_session_clears_local_id(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.start_session(platform="cli")
@@ -93,33 +206,42 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_capture_payload_shape(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.start_session(platform="telegram")
+                # HIPP0 dedups capture bodies within a 24h window against
+                # the persistent /tmp SQLite db, so live runs must send a
+                # unique conversation or risk a ``duplicate`` status.
+                conv_suffix = uuid.uuid4().hex[:8] if is_live() else ""
                 result = await provider.capture(
-                    "USER: hi\nASSISTANT: hello",
+                    f"USER: hi {conv_suffix}\nASSISTANT: hello",
                     source="hermes",
                     source_event_id="tg-msg-1",
                     source_channel="tg-chat-7",
                 )
                 assert "capture_id" in result
-                assert result["status"] == "processing"
-                call = hipp0.last_call("/api/capture")
-                assert call is not None
-                body = call.body
-                assert body["agent_name"] == "alice"
-                assert body["project_id"] == provider.project_id
-                assert body["conversation"].startswith("USER: hi")
-                assert body["session_id"] == provider.session_id
-                assert body["source"] == "hermes"
-                assert body["source_event_id"] == "tg-msg-1"
-                assert body["source_channel"] == "tg-chat-7"
+                # Per HIPP0_REQUESTS.md §4, both "processing" and
+                # "duplicate" are terminal-accept statuses on the
+                # provider side; accept either so the test is stable
+                # even if a prior run seeded the dedup table.
+                assert result["status"] in ("processing", "duplicate")
+                if not is_live():
+                    call = hipp0.last_call("/api/capture")
+                    assert call is not None
+                    body = call.body
+                    assert body["agent_name"] == provider.agent_name
+                    assert body["project_id"] == provider.project_id
+                    assert body["conversation"].startswith("USER: hi")
+                    assert body["session_id"] == provider.session_id
+                    assert body["source"] == "hermes"
+                    assert body["source_event_id"] == "tg-msg-1"
+                    assert body["source_channel"] == "tg-chat-7"
             finally:
                 await provider.aclose()
 
     async def test_capture_rejects_oversize_conversation(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 with pytest.raises(ValueError):
@@ -128,28 +250,36 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_compile_returns_compiled_context(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 ctx = await provider.compile("draft the Q3 kickoff")
                 assert isinstance(ctx, CompiledContext)
                 assert ctx.degraded is False
-                assert ctx.decisions, "mock returns one decision"
-                assert ctx.total_tokens == 42
-                call = hipp0.last_call("/api/compile")
-                assert call is not None
-                # Fast-mode query params should be set.
-                assert call.query.get("format") == "json"
-                assert call.query.get("depth") == "default"
-                assert call.query.get("include_patterns") == "false"
-                assert call.query.get("explain") == "false"
-                assert call.body["agent_name"] == "alice"
-                assert call.body["task_description"] == "draft the Q3 kickoff"
+                if is_live():
+                    # The demo project has no seeded decisions, so the
+                    # live compile may legitimately return zero. Just
+                    # assert the shape round-tripped.
+                    assert isinstance(ctx.decisions, list)
+                    assert isinstance(ctx.total_tokens, int)
+                else:
+                    assert ctx.decisions, "mock returns one decision"
+                    assert ctx.total_tokens == 42
+                    call = hipp0.last_call("/api/compile")
+                    assert call is not None
+                    # Fast-mode query params should be set.
+                    assert call.query.get("format") == "json"
+                    assert call.query.get("depth") == "default"
+                    assert call.query.get("include_patterns") == "false"
+                    assert call.query.get("explain") == "false"
+                    assert call.body["agent_name"] == provider.agent_name
+                    assert call.body["task_description"] == "draft the Q3 kickoff"
             finally:
                 await provider.aclose()
 
     async def test_compile_full_mode_params(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        skip_if_mock_only("call-log introspection not available in live mode")
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.compile("session_start", fast_mode=False)
@@ -161,7 +291,7 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_compile_rejects_oversize_task(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 with pytest.raises(ValueError):
@@ -170,7 +300,18 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_record_outcome(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        # The brief-shaped /api/outcomes body (snippet_ids + outcome +
+        # signal_source) is not yet implemented by HIPP0 — see
+        # HIPP0_REQUESTS.md §6. Live HIPP0 400s on this payload because
+        # its handler expects compile_request_id / decision_id. Until
+        # HIPP0 lands the brief contract, the best we can do in live
+        # mode is skip the assertion block and confirm the Python side
+        # doesn't regress against the mock.
+        skip_if_mock_only(
+            "POST /api/outcomes contract divergence — HIPP0 has not yet "
+            "shipped the brief-shaped body; see HIPP0_REQUESTS.md §6"
+        )
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.start_session(platform="cli")
@@ -189,7 +330,7 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_record_outcome_noop_on_empty(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.record_outcome([], "neutral", signal_source="auto_detect")
@@ -198,28 +339,39 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_upsert_user_fact_sends_if_match(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
+                # In live mode we need a fresh external_user_id per run
+                # because HIPP0 persists facts across the /tmp SQLite db,
+                # and If-Match against an existing version would 409.
+                if is_live():
+                    target_user_id = f"user-tg-{uuid.uuid4().hex[:8]}"
+                    etag_arg = None  # no prior version on a fresh user id
+                else:
+                    target_user_id = "user-tg-42"
+                    etag_arg = "etag-old"
+
                 result = await provider.upsert_user_fact(
-                    "user-tg-42",
+                    target_user_id,
                     [
                         {"key": "preferred_contact", "value": "phone", "additive": False},
                         {"key": "interests", "value": "ml", "additive": True},
                     ],
-                    etag="etag-old",
+                    etag=etag_arg,
                 )
                 assert "version" in result
-                call = hipp0.last_call("/api/hermes/user-facts")
-                assert call is not None
-                assert call.headers.get("If-Match") == "etag-old"
-                assert call.body["user_id"] == "user-tg-42"
-                assert len(call.body["facts"]) == 2
+                if not is_live():
+                    call = hipp0.last_call("/api/hermes/user-facts")
+                    assert call is not None
+                    assert call.headers.get("If-Match") == "etag-old"
+                    assert call.body["external_user_id"] == "user-tg-42"
+                    assert len(call.body["facts"]) == 2
             finally:
                 await provider.aclose()
 
     async def test_register_persists_agent_id(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 data = await provider.register(
@@ -228,9 +380,10 @@ class TestHappyPath:
                 )
                 assert "agent_id" in data
                 assert provider.agent_id == data["agent_id"]
-                call = hipp0.last_call("/api/hermes/register")
-                assert call is not None
-                assert call.body["soul"] == "# Alice\n"
+                if not is_live():
+                    call = hipp0.last_call("/api/hermes/register")
+                    assert call is not None
+                    assert call.body["soul"] == "# Alice\n"
             finally:
                 await provider.aclose()
 
@@ -267,7 +420,7 @@ class TestWriteAheadLog:
             await provider.aclose()
 
     async def test_wal_drains_on_next_successful_call(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 # Seed a WAL entry by hand, as if a prior call had failed.
@@ -276,7 +429,7 @@ class TestWriteAheadLog:
                         "kind": "capture",
                         "path": "/api/capture",
                         "body": {
-                            "agent_name": "alice",
+                            "agent_name": provider.agent_name,
                             "project_id": provider.project_id,
                             "conversation": "queued turn",
                             "session_id": None,
@@ -296,15 +449,17 @@ class TestWriteAheadLog:
                 await provider.capture("live turn")
 
                 assert provider.wal_size() == 0, "WAL should have drained"
-                # Both the queued and the live capture should have landed.
-                bodies = [c.body["conversation"] for c in hipp0.calls_for("/api/capture")]
-                assert "queued turn" in bodies
-                assert "live turn" in bodies
+                if not is_live():
+                    # Both the queued and the live capture should have landed.
+                    bodies = [c.body["conversation"] for c in hipp0.calls_for("/api/capture")]
+                    assert "queued turn" in bodies
+                    assert "live turn" in bodies
             finally:
                 await provider.aclose()
 
     async def test_5xx_retries_then_wals(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        skip_if_mock_only("5xx injection requires mock HIPP0")
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 hipp0.queue_failure("/api/capture", status=503, count=10)
@@ -317,7 +472,8 @@ class TestWriteAheadLog:
                 await provider.aclose()
 
     async def test_4xx_does_not_wal(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        skip_if_mock_only("4xx injection requires mock HIPP0")
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 hipp0.queue_failure("/api/capture", status=422, count=1)
@@ -331,7 +487,11 @@ class TestWriteAheadLog:
                 await provider.aclose()
 
     async def test_wal_drain_keeps_order_on_mid_drain_failure(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        skip_if_mock_only(
+            "mid-drain failure test needs queue_failure + hardcoded agent_name "
+            "in seeded WAL entries; requires mock HIPP0"
+        )
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 # Queue three fake entries.
@@ -471,7 +631,8 @@ class TestDegradedMode:
             await provider.aclose()
 
     async def test_compile_5xx_triggers_degraded(self, tmp_path):
-        async with start_mock_hipp0() as hipp0:
+        skip_if_mock_only("5xx injection requires mock HIPP0")
+        async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 hipp0.queue_failure("/api/compile", status=503, count=10)

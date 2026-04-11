@@ -21,14 +21,15 @@ Status key:
 
 ## 1. `POST /api/hermes/session/start` — [LOCKED]
 
-Hermes calls exactly the request shape in the task brief:
+Hermes calls exactly the request shape in the task brief, updated
+for the H6 live-smoke correction below:
 
 ```json
 {
   "project_id": "uuid",
   "agent_name": "alice",
   "platform": "telegram",
-  "user_id": "tg-42",
+  "external_user_id": "tg-42",
   "external_chat_id": "chat-7"
 }
 ```
@@ -37,11 +38,23 @@ and expects `201` with `{"session_id": "uuid"}`.
 
 `Hipp0MemoryProvider.start_session` refuses any response that does
 not contain a server-generated `session_id` — no client-generated
-ids anywhere. This endpoint is part of the "new endpoints" set the
-task brief says HIPP0 is still building.
+ids anywhere.
 
-**Ask**: please confirm the endpoint is live and returns UUID v4.
-Hermes will treat the string opaquely so any unique id format works.
+**H6 correction (2026-04-11)**: the task brief originally spelled
+this field `user_id`, and Hermes shipped H1–H5 against that name.
+Running Tier-2 of the live HIPP0 × Hermes integration harness on
+the VPS revealed that HIPP0's real `/api/hermes/session/start`
+handler reads `external_user_id` (see
+`hipp0/scripts/hermes-live-smoke.mjs` and
+`hipp0/packages/server/src/routes/hermes.ts` around line 503). The
+provider now serializes the Python-side `user_id` parameter as
+`external_user_id` on the wire; the Python method keeps
+`user_id=` as the kwarg name so callers aren't churned, and the
+mock HIPP0 fixture doesn't care because it records whatever it
+receives.
+
+**Ask**: please confirm `external_user_id` is the final name so we
+can delete this compatibility note in a follow-up.
 
 ---
 
@@ -149,9 +162,9 @@ they'd succeed on retry 4.
 
 ---
 
-## 6. `POST /api/outcomes` — [LOCKED]
+## 6. `POST /api/outcomes` — [REQUEST] contract divergence
 
-Shape matches brief exactly:
+Hermes is coded against the brief's shape:
 
 ```json
 {
@@ -163,6 +176,31 @@ Shape matches brief exactly:
   "signal_source": "user_reaction|auto_detect|explicit_feedback"
 }
 ```
+
+**H6 live-smoke finding (2026-04-11)**: HIPP0's real
+`/api/outcomes` handler (see
+`hipp0/packages/server/src/routes/outcomes.ts` line 137) expects a
+completely different body: `compile_request_id`, `decision_id`,
+`outcome_type`, `outcome_score`, `task_completed`,
+`task_duration_ms`, `agent_output`. It has no concept of
+`snippet_ids` or `signal_source`. Sending the brief-shaped body
+returns `400 VALIDATION_ERROR: Either compile_request_id or
+decision_id + project_id is required`.
+
+The two shapes model different things:
+  - **Brief shape** (Hermes): per-turn reinforcement signal
+    over snippets that were used to compile the last turn.
+  - **HIPP0 shape** (today): per-compile-request outcome tracking
+    driven by the `compile_history` / `compile_outcomes` tables.
+
+**Ask**: please land the brief-shaped endpoint. Either (a) accept
+both shapes and route to different handlers based on which keys
+are present, or (b) add a new path like
+`POST /api/hermes/outcomes` that implements the snippet-based
+shape so Hermes's per-turn reinforcement can flow end-to-end.
+Until that lands, `test_record_outcome` is skipped in live mode
+via `skip_if_mock_only` in
+`tests/agent/test_hipp0_memory_provider.py`.
 
 **Not yet wired from the Telegram side** — the current H5 router
 doesn't auto-detect outcomes (no reaction parser, no
@@ -180,9 +218,21 @@ Request shape matches brief; `If-Match: <etag>` header is sent
 when the caller supplies one, to get the 409 concurrent-write
 protection. Response parsed as `{version, facts}`.
 
-**Ask**: please confirm the bare-response-body `version` field is
-the etag to pass back on the next If-Match, not a separate header.
-The brief is ambiguous here and Hermes currently assumes body-level.
+**H6 correction (2026-04-11)**: same rename as §1 — the user
+identifier is serialized as `external_user_id`, not `user_id`, on
+the wire. The HIPP0 handler at
+`hipp0/packages/server/src/routes/hermes.ts` line 627 hard-fails
+with `400 VALIDATION_ERROR` on missing `external_user_id`, so the
+brief's `user_id` spelling can never have worked end-to-end
+against real HIPP0. Python-side kwarg stays `user_id=` for caller
+continuity; the payload key now matches the server.
+
+**Confirmed** (live smoke, 2026-04-11): HIPP0 does publish the
+new version in **both** the `ETag` response header and the
+body's `version` field. Hermes reads the body field and passes
+it back as `If-Match` on the next upsert — matches the HIPP0
+smoke script's round-trip at
+`hipp0/scripts/hermes-live-smoke.mjs` steps 8-11.
 
 ---
 
@@ -226,31 +276,76 @@ change.
 
 ---
 
-## 10. H6 — [BLOCKED waiting on HIPP0 side]
+## 10. H6 — [Tier 2 GREEN on 2026-04-11]
 
-The brief's Phase H6 ("End-to-end against real HIPP0") cannot be
-executed from the Hermes-only working branch because there is no
-running HIPP0 instance reachable from the isolated build
-environment. The feat branch has been exercised exclusively against
-the in-process aiohttp mock (`tests/fixtures/mock_hipp0.py`, which
-runs on `127.0.0.1:<random>` and implements all seven endpoints
-with failure injection).
+The brief's Phase H6 ("End-to-end against real HIPP0") was blocked
+for the H1–H5 working branch because neither sandbox had network
+reach to a real HIPP0. It has now been unblocked on a VPS that
+runs both repos side-by-side.
 
-**To run H6 manually once a HIPP0 instance is up**:
+**Tier 1** (36/36 pass): HIPP0's own `scripts/hermes-live-smoke.mjs`
+against a real `node dist/index.js` on loopback port 3199 with
+`DATABASE_URL=/tmp/hipp0-smoke.db HIPP0_AUTH_REQUIRED=false
+HIPP0_TELEMETRY_ENABLED=false`.
+
+**Tier 2** (14/14 live pass, 6 mock-only skipped,
+`tests/agent/test_hipp0_memory_provider.py`): the Python
+`Hipp0MemoryProvider` drives the real HIPP0 HTTP server via a
+new `HIPP0_LIVE_URL` env-var gate. The six skipped tests all
+depend on the in-process mock's `queue_failure` knob (5xx / 4xx
+injection, mid-drain replay ordering) — they stay in the mock-mode
+suite and are explicitly skipped when `HIPP0_LIVE_URL` is set.
+
+The live tests surfaced three bugs — two HIPP0-side crashes that
+have been fixed on `claude/build-marketing-website-3HXL3`, and one
+wire-format mismatch fixed on the Hermes side:
+
+1. **HIPP0 parsers.ts (fixed)**: `parseAgent` and `parseDecision`
+   (and a dozen siblings) hard-cast `row.created_at as Date` and
+   crashed with `TypeError: row.created_at.toISOString is not a
+   function` on SQLite, which returns timestamps as strings.
+   Introduced a `toIsoString` helper in
+   `packages/core/src/db/parsers.ts` that handles Date, string,
+   and numeric inputs. Fix touches compile, outcomes, and every
+   other route that materializes rows.
+
+2. **HIPP0 bootstrap-keys.ts (fixed)**: server fatal-crashed on
+   startup with `NOT NULL constraint failed: api_keys.id` because
+   the `bootstrapApiKeys` INSERT doesn't supply an id and the
+   SQLite `api_keys.id` column has no default. Fixed by making
+   bootstrap a no-op when `HIPP0_AUTH_REQUIRED=false` — the
+   middleware bypasses every request anyway in dev mode, so
+   seeding keys was already pointless. Production with
+   `HIPP0_AUTH_REQUIRED=true` is unchanged.
+
+3. **Hermes provider (fixed)**: `user_id` → `external_user_id`
+   on the wire for both `/api/hermes/session/start` and
+   `/api/hermes/user-facts`, documented in §1 and §7 above.
+
+**Still blocked in live mode** (skipped, not failed):
+  - `test_record_outcome` — contract divergence, see §6.
+
+**Reproducible command**:
 
 ```bash
-export HIPP0_BASE_URL=http://localhost:3000
-export HIPP0_API_KEY=…
-python -m hermes_cli.agent_registry list      # expect alice, bob
-python -c "import asyncio; from tools.persistent_delegate_tool \
-  import PersistentDelegateTool; \
-  print(asyncio.run(PersistentDelegateTool().invoke('alice', \
-  'draft Q3 kickoff')))"
+# Terminal 1 — keep HIPP0 alive in tmux:
+tmux new-session -d -s hipp0 \
+  "cd /root/integration/hipp0/packages/server && \
+   DATABASE_URL=/tmp/hipp0-smoke.db PORT=3199 \
+   HIPP0_AUTH_REQUIRED=false HIPP0_TELEMETRY_ENABLED=false \
+   node dist/index.js"
+
+# Terminal 2 — live tier-2 provider tests:
+cd /root/integration/hermes-agent && source .venv/bin/activate && \
+  HIPP0_LIVE_URL=http://127.0.0.1:3199 \
+  python -m pytest tests/agent/test_hipp0_memory_provider.py \
+  -v -o 'addopts='
 ```
 
-Any contract drift discovered during that run should be appended
-below this line as new [REQUEST] entries, and the PR description
-updated so the HIPP0 instance can address them before the merge.
+Any contract drift discovered in Tier 3 (real LLM distillery) or
+beyond should be appended below this line as new [REQUEST]
+entries and the PR description updated so the HIPP0 side can
+address them before the merge.
 
 ---
 

@@ -236,12 +236,17 @@ class Hipp0MemoryProvider(MemoryProvider):
         returned id is cached on the provider and reused for subsequent
         capture/compile calls until :meth:`end_session` or a new
         :meth:`start_session`.
+
+        The ``user_id`` parameter is the external-system user identifier
+        (e.g. a Telegram user id) and is serialized as ``external_user_id``
+        on the wire — that's the key HIPP0's ``/api/hermes/session/start``
+        handler reads. See HIPP0_REQUESTS.md §1.
         """
         payload = {
             "project_id": self.project_id,
             "agent_name": self.agent_name,
             "platform": platform,
-            "user_id": user_id,
+            "external_user_id": user_id,
             "external_chat_id": external_chat_id,
         }
         data = await self._post_json("/api/hermes/session/start", payload)
@@ -403,10 +408,13 @@ class Hipp0MemoryProvider(MemoryProvider):
         ``facts`` is a list of ``{"key", "value", "additive"}`` dicts.
         Pass the ``etag`` returned by the last successful upsert as the
         ``If-Match`` header to avoid clobbering concurrent edits.
+
+        ``user_id`` is the external-system user identifier and is sent as
+        ``external_user_id`` — that's the key HIPP0's handler reads.
         """
         payload = {
             "project_id": self.project_id,
-            "user_id": user_id,
+            "external_user_id": user_id,
             "facts": list(facts),
         }
         headers = {"If-Match": etag} if etag else None
