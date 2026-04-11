@@ -1994,6 +1994,111 @@ class TelegramAdapter(BasePlatformAdapter):
     
     # ── Group mention gating ──────────────────────────────────────────────
 
+    # ------------------------------------------------------------------
+    # Persistent-agent routing (feat/persistent-agents-hipp0, H5)
+    # ------------------------------------------------------------------
+
+    def _persistent_agent_router(self):
+        """Lazy accessor for the shared :class:`PersistentAgentRouter`.
+
+        The router is optional: if HIPP0 env vars aren't set, or if
+        there are no registered persistent agents, the router still
+        exists but its :meth:`decide` returns an empty decision for
+        every message, so the gateway's normal flow runs unchanged.
+
+        Cached on the adapter instance so the per-chat sticky-agent
+        and session state survives across messages.
+        """
+        router = getattr(self, "_persistent_router_instance", None)
+        if router is None:
+            try:
+                from gateway.persistent_agent_router import (
+                    PersistentAgentRouter,
+                )
+                router = PersistentAgentRouter()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "[%s] persistent-agent router unavailable: %s",
+                    self.name,
+                    exc,
+                )
+                router = None
+            self._persistent_router_instance = router
+        return router
+
+    async def _maybe_route_persistent_agent(self, event) -> bool:
+        """Hook called from :meth:`_flush_text_batch`.
+
+        Returns True when the message has been fully handled by the
+        persistent-agent layer and the caller should NOT run the normal
+        dispatch path. Returns False in every other case.
+        """
+        router = self._persistent_agent_router()
+        if router is None:
+            return False
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", None)
+        if not chat_id or not event.text:
+            return False
+
+        decision = router.decide(chat_id=str(chat_id), text=event.text)
+
+        if decision.reply is not None:
+            # /agent slash-command reply — send confirmation and stop.
+            try:
+                await self.send(chat_id=str(chat_id), text=decision.reply)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] failed to send /agent reply: %s", self.name, exc
+                )
+            return decision.consumed
+
+        if decision.agent_name is None:
+            return False
+
+        # Dispatch to the persistent delegate.
+        try:
+            result = await router.invoke(
+                chat_id=str(chat_id),
+                agent_name=decision.agent_name,
+                text=decision.stripped_text or event.text,
+                platform="telegram",
+                user_id=getattr(source, "user_id", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] persistent delegate %s failed: %s",
+                self.name,
+                decision.agent_name,
+                exc,
+            )
+            try:
+                await self.send(
+                    chat_id=str(chat_id),
+                    text=(
+                        f"@{decision.agent_name} failed to answer: {exc}"
+                    ),
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return True
+
+        reply_text = result.response or ""
+        if result.compiled_degraded:
+            reply_text = (
+                f"(HIPP0 degraded: {result.degraded_reason or 'unknown'})\n\n"
+                + reply_text
+            )
+        try:
+            await self.send(chat_id=str(chat_id), text=reply_text)
+        except Exception as exc:
+            logger.warning(
+                "[%s] failed to send persistent-delegate reply: %s",
+                self.name,
+                exc,
+            )
+        return True
+
     def _telegram_require_mention(self) -> bool:
         """Return whether group chats should require an explicit bot trigger."""
         configured = self.config.extra.get("require_mention")
@@ -2266,6 +2371,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+
+            # Persistent-agent routing (feat/persistent-agents-hipp0, H5):
+            # give the shared router first dibs on the message. If it
+            # returns True, the message has been fully handled — either
+            # a /agent slash command was answered or a persistent agent
+            # replied via the Hipp0MemoryProvider — and we skip the
+            # standard handle_message path.
+            try:
+                handled = await self._maybe_route_persistent_agent(event)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "[Telegram] persistent-agent routing failed: %s", exc
+                )
+                handled = False
+            if handled:
+                return
+
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
