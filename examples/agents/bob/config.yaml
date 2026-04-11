@@ -1,0 +1,9 @@
+model: anthropic/claude-opus-4.6
+toolset: default
+platform_access:
+  - cli
+  - telegram
+# project_id and agent_id are populated by Hipp0MemoryProvider.register()
+# on first run. See agent/hipp0_memory_provider.py (Phase H2).
+project_id: null
+agent_id: null

@@ -20,7 +20,10 @@ data/
 tmp/
 temp_vision_images/
 hermes-*/*
-examples/
+# Ignore everything under examples/ (datagen artifacts) EXCEPT the
+# persistent-agent example profiles, which are documentation.
+/examples/*
+!/examples/agents/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl
 run_datagen_kimik2-thinking.sh
