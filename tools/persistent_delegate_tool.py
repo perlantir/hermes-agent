@@ -237,7 +237,9 @@ class PersistentDelegateTool:
                 task_description=task,
                 fast_mode=True,
             )
-            system_prompt = self._build_system_prompt(profile, compiled)
+            system_prompt = self._build_system_prompt(
+                profile, compiled, platform=platform,
+            )
 
             run_ctx = DelegateRunContext(
                 agent=profile,
@@ -310,23 +312,23 @@ class PersistentDelegateTool:
     def _build_system_prompt(
         profile: AgentProfile,
         compiled: CompiledContext,
+        *,
+        platform: Optional[str] = None,
     ) -> str:
-        """Compose the delegate's system prompt.
+        """Compose the delegate's system prompt via the slim builder.
 
-        Shape::
-
-            <SOUL.md>
-
-            ---
-
-            <Compiled context block from HIPP0>
-
-        Degraded mode annotations come from
-        :meth:`CompiledContext.as_prompt_block`.
+        Delegates don't want the full Hermes operating manual — their
+        persona (SOUL.md) is authoritative and HIPP0 owns their memory.
+        Delegates always use :func:`agent.prompt_builder.build_slim_system_prompt`.
+        Degraded-mode annotations come from :meth:`CompiledContext.as_prompt_block`.
         """
-        soul = profile.soul.strip()
-        compiled_block = compiled.as_prompt_block()
-        return f"{soul}\n\n---\n\n{compiled_block}\n"
+        from agent.prompt_builder import build_slim_system_prompt
+
+        return build_slim_system_prompt(
+            profile.soul,
+            compiled_context_block=compiled.as_prompt_block(),
+            platform_hint=platform,
+        )
 
 
 # ---------------------------------------------------------------------------

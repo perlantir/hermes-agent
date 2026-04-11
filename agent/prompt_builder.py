@@ -986,3 +986,100 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     if not sections:
         return ""
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+
+
+# =========================================================================
+# Slim system prompt — for persistent delegates
+# =========================================================================
+#
+# Persistent delegates invoked via :class:`tools.persistent_delegate_tool
+# .PersistentDelegateTool` don't need the full Hermes operating manual:
+# they're single-shot personas whose job is to answer one task with the
+# context HIPP0 compiled for them. Shipping the 3–6K token default
+# prompt to a delegate wastes budget and dilutes the SOUL.md persona.
+#
+# build_slim_system_prompt() composes a tight 500–1500 token prompt from:
+#
+#   - the delegate's SOUL.md (identity + role, authoritative)
+#   - an optional CompiledContext block (from HIPP0 /api/compile)
+#   - an optional platform hint (PLATFORM_HINTS[platform_key])
+#   - an optional time/session hint string
+#
+# The non-slim path (AIAgent._build_system_prompt with slim_prompt=False)
+# is unchanged — existing users see zero behavioral difference.
+
+# Soft token budget for the slim prompt. Not enforced — we only assert
+# this in tests. Rough chars/4 heuristic: 1500 tokens ≈ 6000 chars.
+SLIM_PROMPT_TARGET_TOKENS = 1500
+
+
+def build_slim_system_prompt(
+    soul: str,
+    *,
+    compiled_context_block: Optional[str] = None,
+    platform_hint: Optional[str] = None,
+    time_hint: Optional[str] = None,
+    extra_sections: Optional[list] = None,
+) -> str:
+    """Assemble a lightweight system prompt for persistent delegates.
+
+    This intentionally skips:
+      - DEFAULT_AGENT_IDENTITY (SOUL.md already owns identity)
+      - MEMORY_GUIDANCE / SESSION_SEARCH_GUIDANCE / SKILLS_GUIDANCE
+        (delegates don't use the builtin memory/skills tools; their
+        memory lives in HIPP0 and their persona is fixed)
+      - Tool-use enforcement guidance (delegates run a single turn,
+        not a multi-turn loop)
+      - build_context_files_prompt() (AGENTS.md / CLAUDE.md / etc.
+        are parent-agent scope, not delegate scope)
+      - build_skills_system_prompt() (no skills tools enabled)
+
+    Args:
+        soul: SOUL.md content — the delegate's identity and role.
+        compiled_context_block: Optional HIPP0-compiled context text,
+            typically produced by CompiledContext.as_prompt_block().
+        platform_hint: Optional key into PLATFORM_HINTS (e.g. "telegram",
+            "cli", "discord"). Falls through silently if unknown.
+        time_hint: Optional single-line time / session identifier
+            string (e.g. "Conversation started: Fri Apr 11 10:00 AM").
+        extra_sections: Optional list of already-formatted blocks to
+            append verbatim after the compiled context.
+
+    Returns:
+        The assembled prompt as a single string. Sections are joined
+        with blank-line separators.
+    """
+    if not isinstance(soul, str):
+        raise TypeError("soul must be a string")
+
+    parts: list[str] = [soul.strip()]
+
+    if compiled_context_block:
+        parts.append(compiled_context_block.strip())
+
+    if extra_sections:
+        for section in extra_sections:
+            if section and isinstance(section, str):
+                parts.append(section.strip())
+
+    if platform_hint:
+        hint = PLATFORM_HINTS.get(platform_hint.lower().strip())
+        if hint:
+            parts.append(hint)
+
+    if time_hint:
+        parts.append(time_hint.strip())
+
+    return "\n\n".join(p for p in parts if p)
+
+
+def estimate_prompt_tokens(prompt: str) -> int:
+    """Rough token count: 1 token ≈ 4 chars.
+
+    Not a substitute for a real tokenizer — used by tests and by the
+    slim-prompt size assertion. Good enough for the 1.5K vs 3K
+    threshold check in the H4 test.
+    """
+    if not prompt:
+        return 0
+    return max(1, len(prompt) // 4)

@@ -590,6 +590,7 @@ class AIAgent:
         user_id: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
+        slim_prompt: bool = False,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -660,6 +661,14 @@ class AIAgent:
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
+        # Slim-prompt mode — used by persistent delegates (see
+        # tools/persistent_delegate_tool.py + agent/prompt_builder.py's
+        # build_slim_system_prompt). When True, _build_system_prompt
+        # returns a tight 500–1500 token prompt composed of SOUL.md +
+        # optional compiled-context + platform hint only, skipping the
+        # full Hermes operating manual. Zero regression for existing
+        # users: the default (False) keeps the legacy assembly path.
+        self._slim_prompt = slim_prompt
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
@@ -2904,11 +2913,39 @@ class AIAgent:
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
-        
+
         Called once per session (cached on self._cached_system_prompt) and only
         rebuilt after context compression events. This ensures the system prompt
         is stable across all turns in a session, maximizing prefix cache hits.
         """
+        # Slim-prompt short-circuit — persistent delegates skip the full
+        # Hermes operating manual. See agent/prompt_builder.build_slim_system_prompt
+        # for the composition rules.
+        if getattr(self, "_slim_prompt", False):
+            from agent.prompt_builder import build_slim_system_prompt
+            from hermes_time import now as _hermes_now
+
+            _slim_soul = ""
+            if not self.skip_context_files:
+                _slim_soul = load_soul_md() or ""
+            if not _slim_soul:
+                _slim_soul = self.ephemeral_system_prompt or DEFAULT_AGENT_IDENTITY
+            _now = _hermes_now()
+            _time_hint = (
+                f"Conversation started: "
+                f"{_now.strftime('%A, %B %d, %Y %I:%M %p')}"
+            )
+            extra: list[str] = []
+            if system_message:
+                extra.append(system_message)
+            return build_slim_system_prompt(
+                _slim_soul,
+                compiled_context_block=None,
+                platform_hint=self.platform,
+                time_hint=_time_hint,
+                extra_sections=extra,
+            )
+
         # Layers (in order):
         #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
         #   2. User / gateway system prompt (if provided)
