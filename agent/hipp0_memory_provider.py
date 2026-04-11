@@ -377,24 +377,33 @@ class Hipp0MemoryProvider(MemoryProvider):
         outcome: OutcomeLiteral,
         *,
         signal_source: str,
+        note: Optional[str] = None,
     ) -> None:
         """Record reinforcement signal for a set of snippets.
 
-        Hermes must call this at end of turn. ``signal_source`` must be
-        one of ``user_reaction``, ``auto_detect``, ``explicit_feedback``
-        per the HIPP0 contract.
+        Hermes must call this at end of turn. ``signal_source`` is
+        free-form on the server side (e.g. ``telegram_reaction``,
+        ``repeat_question``, ``manual``), but the provider still
+        surfaces it as a kwarg so callers can be explicit.
+
+        Posts to the H6 ``POST /api/hermes/outcomes`` endpoint, not the
+        older compile-request-based ``/api/outcomes`` path. See
+        ``HIPP0_REQUESTS.md §6`` for the contract split. The new
+        endpoint is keyed by opaque ``session_id`` only — no
+        ``agent_name`` on the wire.
         """
         if not snippet_ids:
             return
-        payload = {
+        payload: Dict[str, Any] = {
             "project_id": self.project_id,
             "session_id": self._session_id,
-            "agent_name": self.agent_name,
             "snippet_ids": list(snippet_ids),
             "outcome": outcome,
             "signal_source": signal_source,
         }
-        await self._post_json("/api/outcomes", payload, wal_kind="outcome")
+        if note is not None:
+            payload["note"] = note
+        await self._post_json("/api/hermes/outcomes", payload, wal_kind="outcome")
 
     async def upsert_user_fact(
         self,

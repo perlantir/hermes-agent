@@ -162,45 +162,59 @@ they'd succeed on retry 4.
 
 ---
 
-## 6. `POST /api/outcomes` — [REQUEST] contract divergence
+## 6. `POST /api/hermes/outcomes` — [RESOLVED 2026-04-11]
 
-Hermes is coded against the brief's shape:
+Outcome of H6 Tier 2: HIPP0 landed the brief-shaped endpoint on a
+new path, `POST /api/hermes/outcomes`. The older `POST /api/outcomes`
+is a different concern — it's the compile-request / alignment-analysis
+flow and stays untouched.
+
+**Wire shape** (the Python provider's `record_outcome` sends this):
 
 ```json
 {
-  "project_id": "uuid",
-  "session_id": "uuid",
-  "agent_name": "alice",
-  "snippet_ids": ["uuid", "uuid"],
-  "outcome": "positive|negative|neutral",
-  "signal_source": "user_reaction|auto_detect|explicit_feedback"
+  "project_id":    "uuid",
+  "session_id":    "uuid",
+  "snippet_ids":   ["uuid", "uuid"],
+  "outcome":       "positive|neutral|negative",
+  "signal_source": "telegram_reaction|repeat_question|manual|<string>",
+  "note":          "optional free-form string"
 }
 ```
 
-**H6 live-smoke finding (2026-04-11)**: HIPP0's real
-`/api/outcomes` handler (see
-`hipp0/packages/server/src/routes/outcomes.ts` line 137) expects a
-completely different body: `compile_request_id`, `decision_id`,
-`outcome_type`, `outcome_score`, `task_completed`,
-`task_duration_ms`, `agent_output`. It has no concept of
-`snippet_ids` or `signal_source`. Sending the brief-shaped body
-returns `400 VALIDATION_ERROR: Either compile_request_id or
-decision_id + project_id is required`.
+Response: `201 {"outcome_id": "uuid", "recorded_at": "<iso>"}`.
 
-The two shapes model different things:
-  - **Brief shape** (Hermes): per-turn reinforcement signal
-    over snippets that were used to compile the last turn.
-  - **HIPP0 shape** (today): per-compile-request outcome tracking
-    driven by the `compile_history` / `compile_outcomes` tables.
+Differences from the original brief:
+  - `agent_name` is gone from the wire payload. The new endpoint
+    is keyed by opaque `session_id`; agent context is already bound
+    to the session on the HIPP0 side.
+  - `signal_source` is free-form text (validated ≤ 200 chars), not an
+    enum, so downstream consumers can emit any label they like.
+  - Optional `note` field for attaching reviewer/operator context.
 
-**Ask**: please land the brief-shaped endpoint. Either (a) accept
-both shapes and route to different handlers based on which keys
-are present, or (b) add a new path like
-`POST /api/hermes/outcomes` that implements the snippet-based
-shape so Hermes's per-turn reinforcement can flow end-to-end.
-Until that lands, `test_record_outcome` is skipped in live mode
-via `skip_if_mock_only` in
-`tests/agent/test_hipp0_memory_provider.py`.
+HIPP0 side:
+  - Route: `packages/server/src/routes/hermes.ts` (alongside
+    `/api/hermes/user-facts`). Pattern matches the other
+    `/api/hermes/*` handlers: validation → project-access → DB
+    insert → `logAudit('hermes_outcome_recorded', ...)` →
+    `broadcast('hermes.outcome.recorded', ...)` → 201.
+  - Schema: SQLite migration
+    `packages/core/src/db/migrations/sqlite/037_hermes_outcomes.sql`;
+    Postgres migration `supabase/migrations/055_hermes_outcomes.sql`.
+    `snippet_ids_json` stored as JSON/JSONB so the INSERT takes one
+    string param regardless of dialect.
+  - `session_id` is **opaque TEXT on both dialects** — not an FK.
+    Captures can land via WAL replay long after the session row
+    has been archived, and the Python provider already treats
+    session_id as an opaque token.
+
+Hermes side:
+  - `agent/hipp0_memory_provider.py::record_outcome` now POSTs the
+    new path. Added `note: Optional[str] = None` kwarg.
+  - `tests/agent/test_hipp0_memory_provider.py::test_record_outcome`
+    is now unskipped in live mode.
+  - `tests/fixtures/mock_hipp0.py` replaces its dead
+    `/api/outcomes` handler with `/api/hermes/outcomes`.
 
 **Not yet wired from the Telegram side** — the current H5 router
 doesn't auto-detect outcomes (no reaction parser, no

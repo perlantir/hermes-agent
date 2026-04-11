@@ -1,6 +1,6 @@
 """An in-process mock HIPP0 server for hermes-agent tests.
 
-Implements the six locked endpoints from the ``feat/persistent-agents-hipp0``
+Implements the locked endpoints from the ``feat/persistent-agents-hipp0``
 task brief:
 
     POST /api/hermes/session/start
@@ -8,8 +8,13 @@ task brief:
     POST /api/hermes/register
     POST /api/capture
     POST /api/compile
-    POST /api/outcomes
+    POST /api/hermes/outcomes
     POST /api/hermes/user-facts
+
+The older ``POST /api/outcomes`` (compile-request / alignment-analysis
+flow on the HIPP0 side) is deliberately NOT mocked — the Hermes
+provider's ``record_outcome`` targets ``POST /api/hermes/outcomes``
+per HIPP0_REQUESTS.md §6, so the legacy path has no Python caller.
 
 The mock exposes:
 
@@ -176,12 +181,16 @@ def _build_app(state: MockHipp0) -> web.Application:
         }
         return web.json_response(payload, status=200)
 
-    async def outcomes(request: web.Request) -> web.Response:
+    async def hermes_outcomes(request: web.Request) -> web.Response:
         await _record(request)
         if (s := _extract_failure(state, request.path)) is not None:
             return web.json_response({"error": "forced"}, status=s)
         return web.json_response(
-            {"recorded": True, "weight_updates_scheduled": True}
+            {
+                "outcome_id": f"outcome-{uuid.uuid4()}",
+                "recorded_at": "2026-04-11T00:00:00Z",
+            },
+            status=201,
         )
 
     async def user_facts(request: web.Request) -> web.Response:
@@ -200,7 +209,7 @@ def _build_app(state: MockHipp0) -> web.Application:
     app.router.add_post("/api/hermes/register", register)
     app.router.add_post("/api/capture", capture)
     app.router.add_post("/api/compile", compile_)
-    app.router.add_post("/api/outcomes", outcomes)
+    app.router.add_post("/api/hermes/outcomes", hermes_outcomes)
     app.router.add_post("/api/hermes/user-facts", user_facts)
     return app
 

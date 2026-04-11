@@ -300,32 +300,38 @@ class TestHappyPath:
                 await provider.aclose()
 
     async def test_record_outcome(self, tmp_path):
-        # The brief-shaped /api/outcomes body (snippet_ids + outcome +
-        # signal_source) is not yet implemented by HIPP0 — see
-        # HIPP0_REQUESTS.md §6. Live HIPP0 400s on this payload because
-        # its handler expects compile_request_id / decision_id. Until
-        # HIPP0 lands the brief contract, the best we can do in live
-        # mode is skip the assertion block and confirm the Python side
-        # doesn't regress against the mock.
-        skip_if_mock_only(
-            "POST /api/outcomes contract divergence — HIPP0 has not yet "
-            "shipped the brief-shaped body; see HIPP0_REQUESTS.md §6"
-        )
+        # Posts to POST /api/hermes/outcomes, the brief-shaped endpoint
+        # added to HIPP0 in response to HIPP0_REQUESTS.md §6. The older
+        # POST /api/outcomes is a different compile-request / alignment
+        # flow and is intentionally NOT what record_outcome targets.
         async with _hipp0_endpoint() as hipp0:
             provider = await _make_provider(hipp0.base_url, tmp_path)
             try:
                 await provider.start_session(platform="cli")
+                # HIPP0's new endpoint requires UUID-shaped snippet ids.
+                snippet_ids = [
+                    "11111111-1111-4111-8111-111111111111",
+                    "22222222-2222-4222-8222-222222222222",
+                ]
                 await provider.record_outcome(
-                    ["snip-a", "snip-b"],
+                    snippet_ids,
                     "positive",
-                    signal_source="user_reaction",
+                    signal_source="telegram_reaction",
+                    note="👍 on last turn",
                 )
-                call = hipp0.last_call("/api/outcomes")
-                assert call is not None
-                assert call.body["snippet_ids"] == ["snip-a", "snip-b"]
-                assert call.body["outcome"] == "positive"
-                assert call.body["signal_source"] == "user_reaction"
-                assert call.body["session_id"] == provider.session_id
+                if not is_live():
+                    call = hipp0.last_call("/api/hermes/outcomes")
+                    assert call is not None
+                    assert call.body["project_id"] == provider.project_id
+                    assert call.body["snippet_ids"] == snippet_ids
+                    assert call.body["outcome"] == "positive"
+                    assert call.body["signal_source"] == "telegram_reaction"
+                    assert call.body["session_id"] == provider.session_id
+                    assert call.body["note"] == "👍 on last turn"
+                    # agent_name was dropped from the wire payload in the
+                    # /api/hermes/outcomes migration (session_id carries
+                    # the agent context on the server side).
+                    assert "agent_name" not in call.body
             finally:
                 await provider.aclose()
 
