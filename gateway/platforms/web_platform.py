@@ -10,8 +10,10 @@ Client -> Server:
 Server -> Client:
   { "type": "stream_start", "conversation_id": "...", "agent_name": "...", "model": "..." }
   { "type": "stream_delta", "content": "partial token" }
-  { "type": "tool_call", "tool_name": "...", "tool_emoji": "...", "status": "...", ... }
+  { "type": "tool_call", "tool_name": "...", "tool_emoji": "...", "status": "started|completed|error", ... }
   { "type": "stream_end", "conversation_id": "...", "tokens": {...}, "duration_seconds": ... }
+  { "type": "status", "status": "thinking|compiling|capturing|idle", "message": "..." }
+  { "type": "hipp0_event", "event": "compile_start|compile_done|capture_start|capture_done", ... }
   { "type": "error", "message": "...", "recoverable": true }
 
 Each WebSocket connection maintains its own AIAgent instances keyed by
@@ -39,6 +41,32 @@ import websockets
 import websockets.server
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tool emoji map for tool_call WebSocket messages
+# ---------------------------------------------------------------------------
+
+TOOL_EMOJI: Dict[str, str] = {
+    "web_search": "\U0001f50d",
+    "search": "\U0001f50d",
+    "read_file": "\U0001f4c4",
+    "write_file": "\u270f\ufe0f",
+    "patch": "\u270f\ufe0f",
+    "terminal": "\U0001f4bb",
+    "bash": "\U0001f4bb",
+    "recall": "\U0001f9e0",
+    "memory_read": "\U0001f9e0",
+    "memory_write": "\U0001f9e0",
+    "delegate": "\U0001f91d",
+    "persistent_delegate": "\U0001f91d",
+    "session_search": "\U0001f4cb",
+}
+
+
+def _tool_emoji(name: str) -> str:
+    """Return an emoji for a tool name, defaulting to wrench."""
+    return TOOL_EMOJI.get(name, "\U0001f527")
+
 
 # ---------------------------------------------------------------------------
 # Ensure repo root is on sys.path so hermes imports resolve
@@ -76,11 +104,18 @@ ALLOWED_ORIGINS = {
 
 class _Hipp0SyncAdapter:
     """Thin sync wrapper bridging async Hipp0MemoryProvider into the sync
-    MemoryProvider ABC that AIAgent's MemoryManager expects."""
+    MemoryProvider ABC that AIAgent's MemoryManager expects.
+
+    The optional ``ws_emit`` callback is called from the worker thread to
+    send status/hipp0_event messages over the WebSocket.  It is set per-turn
+    by ``_handle_message`` before the agent runs.
+    """
 
     def __init__(self, provider: Hipp0MemoryProvider, loop: asyncio.AbstractEventLoop) -> None:
         self._provider = provider
         self._loop = loop
+        # Set per-turn by _handle_message; signature: (msg_dict) -> None
+        self.ws_emit: Optional[callable] = None
 
     @property
     def name(self) -> str:
@@ -95,15 +130,37 @@ class _Hipp0SyncAdapter:
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []
 
+    def _emit(self, msg: dict) -> None:
+        """Send a WebSocket message via the per-turn callback (thread-safe)."""
+        cb = self.ws_emit
+        if cb is not None:
+            try:
+                cb(msg)
+            except Exception:
+                pass
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not query:
             return ""
+        self._emit({"type": "status", "status": "compiling", "message": "Fetching context from HIPP0..."})
+        self._emit({"type": "hipp0_event", "event": "compile_start"})
+        t0 = time.time()
         try:
             compiled = self._loop.run_until_complete(
                 self._provider.compile(query, fast_mode=True)
             )
+            duration_ms = round((time.time() - t0) * 1000)
+            n_decisions = len(compiled.decisions)
+            self._emit({
+                "type": "hipp0_event",
+                "event": "compile_done",
+                "decisions": n_decisions,
+                "duration_ms": duration_ms,
+            })
             return compiled.as_prompt_block()
         except Exception as e:
+            duration_ms = round((time.time() - t0) * 1000)
+            self._emit({"type": "hipp0_event", "event": "compile_done", "decisions": 0, "duration_ms": duration_ms})
             logger.warning("HIPP0 prefetch failed: %s", e)
             return ""
 
@@ -111,12 +168,27 @@ class _Hipp0SyncAdapter:
         pass
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        self._emit({"type": "status", "status": "capturing", "message": "Saving to memory..."})
+        self._emit({"type": "hipp0_event", "event": "capture_start"})
+        t0 = time.time()
         transcript = f"USER: {user_content}\nASSISTANT: {assistant_content}"
         try:
-            self._loop.run_until_complete(
+            result = self._loop.run_until_complete(
                 self._provider.capture(transcript, source="hermes")
             )
+            duration_ms = round((time.time() - t0) * 1000)
+            facts_extracted = 0
+            if isinstance(result, dict):
+                facts_extracted = result.get("facts_extracted", 0)
+            self._emit({
+                "type": "hipp0_event",
+                "event": "capture_done",
+                "facts_extracted": facts_extracted,
+                "duration_ms": duration_ms,
+            })
         except Exception as e:
+            duration_ms = round((time.time() - t0) * 1000)
+            self._emit({"type": "hipp0_event", "event": "capture_done", "facts_extracted": 0, "duration_ms": duration_ms})
             logger.warning("HIPP0 capture failed: %s", e)
 
     def system_prompt_block(self) -> str:
@@ -166,9 +238,13 @@ class _AgentSession:
         self._ws_loop = ws_loop
         self._agent = None
         self._provider = None
+        self._adapter: Optional[_Hipp0SyncAdapter] = None
         self._agent_loop = None
         self._model = "claude-sonnet-4-6"
         self._interrupted = False
+        # Per-turn callback for sending WS events from the worker thread.
+        # Set by _handle_message before each chat call.
+        self._ws_emit: Optional[callable] = None
 
     def setup(self) -> None:
         """Initialize the AIAgent + HIPP0 provider (called in worker thread)."""
@@ -203,6 +279,12 @@ class _AgentSession:
             logger.warning("Failed to start HIPP0 session for %s: %s", self.agent_name, e)
             session_id = str(uuid.uuid4())
 
+        # Emit compile status during initial setup
+        if self._ws_emit:
+            self._ws_emit({"type": "status", "status": "compiling", "message": "Fetching context from HIPP0..."})
+            self._ws_emit({"type": "hipp0_event", "event": "compile_start"})
+
+        t0 = time.time()
         # Compile initial context
         try:
             compiled = self._agent_loop.run_until_complete(
@@ -210,6 +292,15 @@ class _AgentSession:
             )
         except Exception:
             compiled = CompiledContext(degraded=True, degraded_reason="compile failed at session start")
+
+        if self._ws_emit:
+            duration_ms = round((time.time() - t0) * 1000)
+            self._ws_emit({
+                "type": "hipp0_event",
+                "event": "compile_done",
+                "decisions": len(compiled.decisions),
+                "duration_ms": duration_ms,
+            })
 
         # Fetch supplementary context (decisions, captures, user_facts)
         extra_sections = self._fetch_extra_context(profile)
@@ -243,11 +334,11 @@ class _AgentSession:
         )
 
         # Wire HIPP0 as external memory provider
-        adapter = _Hipp0SyncAdapter(self._provider, self._agent_loop)
+        self._adapter = _Hipp0SyncAdapter(self._provider, self._agent_loop)
         if self._agent._memory_manager is None:
             self._agent._memory_manager = MemoryManager()
-        self._agent._memory_manager.add_provider(adapter)
-        adapter.initialize(session_id, platform="web", hermes_home=str(hermes_home))
+        self._agent._memory_manager.add_provider(self._adapter)
+        self._adapter.initialize(session_id, platform="web", hermes_home=str(hermes_home))
 
     def _fetch_extra_context(self, profile: Any) -> List[str]:
         """Fetch decisions, captures, user_facts from HIPP0 (same as repl.py)."""
@@ -325,7 +416,66 @@ class _AgentSession:
         if self._agent is None:
             raise RuntimeError("Agent session not initialized")
         self._interrupted = False
-        return self._agent.chat(content, stream_callback=stream_callback)
+
+        # Wire per-turn WebSocket emit into the adapter and AIAgent callbacks
+        emit = self._ws_emit
+        if self._adapter is not None:
+            self._adapter.ws_emit = emit
+
+        if emit is not None:
+            # Track active tool calls for duration measurement
+            _tool_starts: Dict[str, float] = {}
+
+            def _on_tool_progress(event_type, function_name=None, preview=None, function_args=None, **kwargs):
+                if function_name and function_name.startswith("_"):
+                    return  # skip internal tools
+                if event_type == "tool.started":
+                    _tool_starts[function_name or ""] = time.time()
+                    args_preview = ""
+                    if function_args:
+                        # Build a short preview from the first string arg
+                        for v in function_args.values():
+                            if isinstance(v, str) and v.strip():
+                                args_preview = v[:100]
+                                break
+                    emit({
+                        "type": "tool_call",
+                        "tool_name": function_name,
+                        "tool_emoji": _tool_emoji(function_name or ""),
+                        "args_preview": args_preview,
+                        "status": "started",
+                    })
+                elif event_type == "tool.completed":
+                    duration_ms = round((time.time() - _tool_starts.pop(function_name or "", time.time())) * 1000)
+                    is_error = kwargs.get("is_error", False)
+                    emit({
+                        "type": "tool_call",
+                        "tool_name": function_name,
+                        "tool_emoji": _tool_emoji(function_name or ""),
+                        "status": "error" if is_error else "completed",
+                        "duration_ms": duration_ms,
+                    })
+
+            def _on_thinking(text):
+                if text:
+                    emit({"type": "status", "status": "thinking", "message": text})
+
+            self._agent.tool_progress_callback = _on_tool_progress
+            self._agent.thinking_callback = _on_thinking
+
+            # Emit thinking status before the LLM call
+            emit({"type": "status", "status": "thinking", "message": "Processing your request..."})
+
+        result = self._agent.chat(content, stream_callback=stream_callback)
+
+        # Clear per-turn callbacks
+        if emit is not None:
+            self._agent.tool_progress_callback = None
+            self._agent.thinking_callback = None
+            if self._adapter is not None:
+                self._adapter.ws_emit = None
+
+        return result
 
     def interrupt(self) -> None:
         """Signal the agent to stop the current generation."""
@@ -443,16 +593,22 @@ async def _handle_message(
     start_time = time.time()
     token_buf = {"chunks": 0}
 
+    # Thread-safe emit: schedule a WS send from the worker thread
+    def ws_emit(msg: dict) -> None:
+        asyncio.run_coroutine_threadsafe(_send_json(ws, msg), loop)
+
     # Stream callback — sends deltas back over WebSocket from worker thread
     def on_delta(text: str):
         if session._interrupted:
             return
         token_buf["chunks"] += 1
-        # Schedule the send on the event loop from the worker thread
         asyncio.run_coroutine_threadsafe(
             _send_json(ws, {"type": "stream_delta", "content": text}),
             loop,
         )
+
+    # Set per-turn emit callback on the session
+    session._ws_emit = ws_emit
 
     # Run the blocking chat() in a thread
     error_msg = None
@@ -485,6 +641,12 @@ async def _handle_message(
         "tokens": {"chunks": token_buf["chunks"]},
         "duration_seconds": round(duration, 2),
     })
+
+    # Emit idle status after everything is done
+    await _send_json(ws, {"type": "status", "status": "idle"})
+
+    # Clear per-turn emit
+    session._ws_emit = None
 
 
 async def _handle_command(
