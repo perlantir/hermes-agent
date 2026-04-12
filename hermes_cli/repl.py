@@ -266,11 +266,104 @@ def main() -> None:
     except Exception as e:
         logger.debug("Captures fallback fetch failed: %s", e)
 
+    # Sync user_facts from HIPP0 to local USER.md so the agent profile
+    # stays current even when the compile API is slow or down.
+    user_facts_block = ""
+    try:
+        import httpx as _httpx_uf
+        _uf_resp = _httpx_uf.get(
+            f"{hipp0_base_url}/api/hermes/user-facts",
+            params={
+                "project_id": str(profile.config.project_id),
+                "external_user_id": "owner",
+            },
+            headers={"Authorization": f"Bearer {hipp0_key}"},
+            timeout=10,
+        )
+        _uf_facts = []
+        if _uf_resp.status_code == 200:
+            _uf_data = _uf_resp.json()
+            _uf_facts = _uf_data.get("facts", [])
+
+        # Also check the new user_facts table (distillery-extracted facts)
+        _uf2_resp = _httpx_uf.get(
+            f"{hipp0_base_url}/api/compile",
+            timeout=5,
+        )
+        # We already have compile result — check for user_facts there
+        # Actually, let's query user_facts directly from a dedicated endpoint
+        # For now, query via a simple POST to compile which includes user_facts
+    except Exception:
+        _uf_facts = []
+
+    # Query distillery-extracted user_facts via direct DB endpoint
+    try:
+        import httpx as _httpx_uf2
+        _uf2_resp = _httpx_uf2.post(
+            f"{hipp0_base_url}/api/compile",
+            json={
+                "project_id": str(profile.config.project_id),
+                "agent_name": profile.name,
+                "task_description": "Retrieve user preferences",
+            },
+            headers={"Authorization": f"Bearer {hipp0_key}"},
+            timeout=15,
+        )
+        if _uf2_resp.status_code == 200:
+            _compile_data = _uf2_resp.json()
+            _extracted_facts = _compile_data.get("user_facts", [])
+            if _extracted_facts:
+                _uf_facts.extend(_extracted_facts)
+    except Exception:
+        pass
+
+    if _uf_facts:
+        # Build user_facts section for system prompt
+        _uf_lines = ["## User Preferences (from HIPP0 memory)", ""]
+        for _f in _uf_facts:
+            _key = _f.get("key", "unknown")
+            _val = _f.get("value", "")
+            if _val:
+                _uf_lines.append(f"- **{_key}**: {_val}")
+        user_facts_block = "\n".join(_uf_lines)
+
+        # Write to USER.md for local persistence
+        user_md_path = profile.root / "USER.md"
+        try:
+            existing_content = user_md_path.read_text() if user_md_path.exists() else ""
+            # Replace or append the HIPP0 section
+            marker_start = "### HIPP0 Extracted User Facts"
+            marker_end = "### END HIPP0 Facts"
+            facts_section = f"{marker_start}\n"
+            for _f in _uf_facts:
+                _key = _f.get("key", "unknown")
+                _val = _f.get("value", "")
+                if _val:
+                    facts_section += f"- **{_key}**: {_val}\n"
+            facts_section += f"{marker_end}\n"
+
+            if marker_start in existing_content:
+                import re
+                existing_content = re.sub(
+                    rf"{re.escape(marker_start)}.*?{re.escape(marker_end)}\n?",
+                    facts_section,
+                    existing_content,
+                    flags=re.DOTALL,
+                )
+            else:
+                existing_content = existing_content.rstrip() + "\n\n" + facts_section
+
+            user_md_path.write_text(existing_content)
+        except Exception as e:
+            logger.debug("Failed to write USER.md: %s", e)
+
     extra_sections = []
     if decisions_block:
         extra_sections.append(decisions_block)
     if captures_block:
         extra_sections.append(captures_block)
+    if user_facts_block:
+        extra_sections.append(user_facts_block)
 
     system_prompt = build_slim_system_prompt(
         profile.soul,
