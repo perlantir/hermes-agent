@@ -235,11 +235,48 @@ def main() -> None:
         except Exception as e:
             logger.debug("Direct decisions fetch failed: %s", e)
 
+    # Cross-session memory fallback: fetch recent captures (raw conversation
+    # transcripts) for this agent so Alice can remember what was said in
+    # previous sessions even before the distillery extracts structured facts.
+    captures_block = ""
+    try:
+        import httpx as _httpx_cap
+        _cap_resp = _httpx_cap.get(
+            f"{hipp0_base_url}/api/hermes/captures",
+            params={
+                "project_id": str(profile.config.project_id),
+                "agent_name": profile.name,
+                "limit": "10",
+            },
+            headers={"Authorization": f"Bearer {hipp0_key}"},
+            timeout=10,
+        )
+        if _cap_resp.status_code == 200:
+            _captures = _cap_resp.json()
+            if _captures:
+                _cap_lines = ["## Recent conversations (from HIPP0 memory)", ""]
+                for _cap in _captures:
+                    _text = (_cap.get("conversation_text") or "")[:500]
+                    _ts = _cap.get("created_at", "unknown")
+                    if _text.strip():
+                        _cap_lines.append(f"### Session ({_ts})")
+                        _cap_lines.append(_text)
+                        _cap_lines.append("")
+                captures_block = "\n".join(_cap_lines)
+    except Exception as e:
+        logger.debug("Captures fallback fetch failed: %s", e)
+
+    extra_sections = []
+    if decisions_block:
+        extra_sections.append(decisions_block)
+    if captures_block:
+        extra_sections.append(captures_block)
+
     system_prompt = build_slim_system_prompt(
         profile.soul,
         compiled_context_block=compiled.as_prompt_block(),
         platform_hint="cli",
-        extra_sections=[decisions_block] if decisions_block else None,
+        extra_sections=extra_sections if extra_sections else None,
     )
 
     # ---- Session DB for session_search tool ----
