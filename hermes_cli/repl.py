@@ -269,53 +269,25 @@ def main() -> None:
     # Sync user_facts from HIPP0 to local USER.md so the agent profile
     # stays current even when the compile API is slow or down.
     user_facts_block = ""
+    _uf_facts: list = []
     try:
         import httpx as _httpx_uf
+        # Query the lightweight extracted-facts endpoint (distillery-extracted
+        # user_facts from the user_facts table).
         _uf_resp = _httpx_uf.get(
-            f"{hipp0_base_url}/api/hermes/user-facts",
+            f"{hipp0_base_url}/api/hermes/extracted-facts",
             params={
                 "project_id": str(profile.config.project_id),
-                "external_user_id": "owner",
+                "agent_name": profile.name,
             },
             headers={"Authorization": f"Bearer {hipp0_key}"},
             timeout=10,
         )
-        _uf_facts = []
         if _uf_resp.status_code == 200:
             _uf_data = _uf_resp.json()
             _uf_facts = _uf_data.get("facts", [])
-
-        # Also check the new user_facts table (distillery-extracted facts)
-        _uf2_resp = _httpx_uf.get(
-            f"{hipp0_base_url}/api/compile",
-            timeout=5,
-        )
-        # We already have compile result — check for user_facts there
-        # Actually, let's query user_facts directly from a dedicated endpoint
-        # For now, query via a simple POST to compile which includes user_facts
-    except Exception:
-        _uf_facts = []
-
-    # Query distillery-extracted user_facts via direct DB endpoint
-    try:
-        import httpx as _httpx_uf2
-        _uf2_resp = _httpx_uf2.post(
-            f"{hipp0_base_url}/api/compile",
-            json={
-                "project_id": str(profile.config.project_id),
-                "agent_name": profile.name,
-                "task_description": "Retrieve user preferences",
-            },
-            headers={"Authorization": f"Bearer {hipp0_key}"},
-            timeout=15,
-        )
-        if _uf2_resp.status_code == 200:
-            _compile_data = _uf2_resp.json()
-            _extracted_facts = _compile_data.get("user_facts", [])
-            if _extracted_facts:
-                _uf_facts.extend(_extracted_facts)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Extracted user-facts fetch failed: %s", e)
 
     if _uf_facts:
         # Build user_facts section for system prompt
