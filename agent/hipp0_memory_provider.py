@@ -86,6 +86,13 @@ class CompiledContext:
     contrastive_pairs: Optional[List[Dict[str, Any]]] = None
     degraded: bool = False
     degraded_reason: Optional[str] = None
+    # Extended fields for audit trail
+    decisions_considered: int = 0
+    decisions_included: int = 0
+    user_facts: List[Dict[str, Any]] = field(default_factory=list)
+    compilation_time_ms: int = 0
+    token_count: int = 0
+    raw_response: Optional[Dict[str, Any]] = None
 
     def as_prompt_block(self) -> str:
         """Render the compiled context as a plain-text prompt block.
@@ -369,6 +376,12 @@ class Hipp0MemoryProvider(MemoryProvider):
             role_signal=data.get("role_signal"),
             contrastive_pairs=data.get("contrastive_pairs"),
             degraded=False,
+            decisions_considered=int(data.get("decisions_considered") or 0),
+            decisions_included=int(data.get("decisions_included") or 0),
+            user_facts=list(data.get("user_facts") or []),
+            compilation_time_ms=int(data.get("compilation_time_ms") or 0),
+            token_count=int(data.get("token_count") or 0),
+            raw_response=data,
         )
 
     async def record_outcome(

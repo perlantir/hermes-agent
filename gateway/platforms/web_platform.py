@@ -150,17 +150,40 @@ class _Hipp0SyncAdapter:
                 self._provider.compile(query, fast_mode=True)
             )
             duration_ms = round((time.time() - t0) * 1000)
-            n_decisions = len(compiled.decisions)
+            # Build rich compile_done event for audit trail
+            top_decisions = []
+            for d in compiled.decisions[:5]:
+                breakdown = d.get("scoring_breakdown") or {}
+                top_decisions.append({
+                    "title": d.get("title", "?")[:80],
+                    "score": round(d.get("combined_score", 0), 3),
+                    "freshness": round(breakdown.get("freshness", 0), 3),
+                    "tier": d.get("temporal_tier", "permanent"),
+                })
+            user_facts_out = []
+            for uf in compiled.user_facts[:10]:
+                user_facts_out.append({
+                    "key": uf.get("key", "?"),
+                    "value": uf.get("value", ""),
+                    "category": uf.get("category", "general"),
+                })
             self._emit({
                 "type": "hipp0_event",
                 "event": "compile_done",
-                "decisions": n_decisions,
+                "decisions": len(compiled.decisions),
+                "decisions_scanned": compiled.decisions_considered,
+                "decisions_passed": compiled.decisions_included,
+                "user_facts_loaded": len(compiled.user_facts),
+                "top_decisions": top_decisions,
+                "user_facts": user_facts_out,
+                "context_tokens": compiled.token_count or compiled.total_tokens,
+                "context_budget": 4000,
                 "duration_ms": duration_ms,
             })
             return compiled.as_prompt_block()
         except Exception as e:
             duration_ms = round((time.time() - t0) * 1000)
-            self._emit({"type": "hipp0_event", "event": "compile_done", "decisions": 0, "duration_ms": duration_ms})
+            self._emit({"type": "hipp0_event", "event": "compile_done", "decisions": 0, "decisions_scanned": 0, "decisions_passed": 0, "user_facts_loaded": 0, "top_decisions": [], "user_facts": [], "context_tokens": 0, "context_budget": 4000, "duration_ms": duration_ms})
             logger.warning("HIPP0 prefetch failed: %s", e)
             return ""
 
@@ -172,23 +195,29 @@ class _Hipp0SyncAdapter:
         self._emit({"type": "hipp0_event", "event": "capture_start"})
         t0 = time.time()
         transcript = f"USER: {user_content}\nASSISTANT: {assistant_content}"
+        transcript_tokens = max(1, len(transcript) // 4)
         try:
             result = self._loop.run_until_complete(
                 self._provider.capture(transcript, source="hermes")
             )
             duration_ms = round((time.time() - t0) * 1000)
             facts_extracted = 0
+            decisions_extracted = 0
             if isinstance(result, dict):
                 facts_extracted = result.get("facts_extracted", 0)
+                decisions_extracted = result.get("decisions_extracted", 0)
             self._emit({
                 "type": "hipp0_event",
                 "event": "capture_done",
+                "transcript_tokens": transcript_tokens,
                 "facts_extracted": facts_extracted,
+                "decisions_extracted": decisions_extracted,
+                "distillery_status": "processing",
                 "duration_ms": duration_ms,
             })
         except Exception as e:
             duration_ms = round((time.time() - t0) * 1000)
-            self._emit({"type": "hipp0_event", "event": "capture_done", "facts_extracted": 0, "duration_ms": duration_ms})
+            self._emit({"type": "hipp0_event", "event": "capture_done", "transcript_tokens": transcript_tokens, "facts_extracted": 0, "decisions_extracted": 0, "distillery_status": "error", "duration_ms": duration_ms})
             logger.warning("HIPP0 capture failed: %s", e)
 
     def system_prompt_block(self) -> str:
@@ -295,10 +324,27 @@ class _AgentSession:
 
         if self._ws_emit:
             duration_ms = round((time.time() - t0) * 1000)
+            top_decisions = []
+            for d in compiled.decisions[:5]:
+                breakdown = d.get("scoring_breakdown") or {}
+                top_decisions.append({
+                    "title": d.get("title", "?")[:80],
+                    "score": round(d.get("combined_score", 0), 3),
+                    "freshness": round(breakdown.get("freshness", 0), 3),
+                    "tier": d.get("temporal_tier", "permanent"),
+                })
+            user_facts_out = [{"key": uf.get("key", "?"), "value": uf.get("value", ""), "category": uf.get("category", "general")} for uf in compiled.user_facts[:10]]
             self._ws_emit({
                 "type": "hipp0_event",
                 "event": "compile_done",
                 "decisions": len(compiled.decisions),
+                "decisions_scanned": compiled.decisions_considered,
+                "decisions_passed": compiled.decisions_included,
+                "user_facts_loaded": len(compiled.user_facts),
+                "top_decisions": top_decisions,
+                "user_facts": user_facts_out,
+                "context_tokens": compiled.token_count or compiled.total_tokens,
+                "context_budget": 4000,
                 "duration_ms": duration_ms,
             })
 
@@ -581,6 +627,7 @@ async def _handle_message(
 
     session = state.get_or_create_session(agent_name)
     conversation_id = session.conversation_id
+    is_first_turn = session._agent is None
 
     # Send stream_start
     await _send_json(ws, {
@@ -591,7 +638,7 @@ async def _handle_message(
     })
 
     start_time = time.time()
-    token_buf = {"chunks": 0}
+    token_buf = {"chunks": 0, "tool_calls_count": 0}
 
     # Thread-safe emit: schedule a WS send from the worker thread
     def ws_emit(msg: dict) -> None:
@@ -617,6 +664,19 @@ async def _handle_message(
             # Ensure the session is initialized (first call sets up AIAgent)
             if session._agent is None:
                 session.setup()
+                # Emit agent_setup event after first init
+                try:
+                    profile = get_agent(agent_name)
+                    soul_tokens = max(1, len(profile.soul) // 4) if profile.soul else 0
+                    ws_emit({
+                        "type": "agent_setup",
+                        "agent_name": agent_name,
+                        "model": session._model,
+                        "provider": "anthropic",
+                        "soul_md_tokens": soul_tokens,
+                    })
+                except Exception:
+                    pass
             return session.chat(content, stream_callback=on_delta)
 
         final_response = await loop.run_in_executor(_get_executor(), _run_chat)
@@ -634,12 +694,30 @@ async def _handle_message(
             "recoverable": True,
         })
 
+    # Estimate tokens and cost for audit trail
+    input_tokens_est = max(1, len(content) // 4) + 2000  # user msg + system prompt estimate
+    output_tokens_est = max(1, len(final_response) // 4) if final_response else 0
+    # Cost rates per million tokens
+    cost_rates = {
+        "claude-sonnet-4-6": (3.0, 15.0),
+        "claude-opus-4-6": (15.0, 75.0),
+        "claude-haiku-4-5": (0.25, 1.25),
+    }
+    in_rate, out_rate = cost_rates.get(session._model, (3.0, 15.0))
+    cost_estimate = (input_tokens_est * in_rate + output_tokens_est * out_rate) / 1_000_000
+
     # Send stream_end
     await _send_json(ws, {
         "type": "stream_end",
         "conversation_id": conversation_id,
-        "tokens": {"chunks": token_buf["chunks"]},
+        "tokens": {
+            "chunks": token_buf["chunks"],
+            "input": input_tokens_est,
+            "output": output_tokens_est,
+        },
         "duration_seconds": round(duration, 2),
+        "cost_estimate_usd": round(cost_estimate, 4),
+        "model": session._model,
     })
 
     # Emit idle status after everything is done
