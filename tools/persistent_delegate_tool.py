@@ -363,7 +363,7 @@ async def _default_aiagent_runner(
             model=model,
             base_url=base_url,
             api_key=api_key,
-            max_iterations=50,
+            max_iterations=10,
             quiet_mode=True,
             ephemeral_system_prompt=system_prompt,
             platform=getattr(parent, "platform", "cli"),
@@ -384,7 +384,12 @@ async def _default_aiagent_runner(
         )
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run_sync)
+    # Hard 120-second timeout for delegated tasks to prevent runaway sub-agents
+    delegate_timeout = int(os.environ.get("HERMES_DELEGATE_TIMEOUT", "120"))
+    return await asyncio.wait_for(
+        loop.run_in_executor(None, _run_sync),
+        timeout=delegate_timeout,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ def _get_max_concurrent_children() -> int:
         except (TypeError, ValueError):
             pass
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
-DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_MAX_ITERATIONS = 10
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
