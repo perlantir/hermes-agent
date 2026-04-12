@@ -245,7 +245,7 @@ def main() -> None:
             f"{hipp0_base_url}/api/hermes/captures",
             params={
                 "project_id": str(profile.config.project_id),
-                "limit": "10",
+                "limit": "20",
             },
             headers={"Authorization": f"Bearer {hipp0_key}"},
             timeout=10,
@@ -277,6 +277,7 @@ def main() -> None:
             f"{hipp0_base_url}/api/hermes/extracted-facts",
             params={
                 "project_id": str(profile.config.project_id),
+                "external_user_id": "owner",
             },
             headers={"Authorization": f"Bearer {hipp0_key}"},
             timeout=10,
