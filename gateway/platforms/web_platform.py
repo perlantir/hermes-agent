@@ -417,7 +417,7 @@ class _AgentSession:
         try:
             resp = httpx.get(
                 f"{HIPP0_BASE_URL}/api/hermes/captures",
-                params={"project_id": project_id, "agent_name": profile.name, "limit": "10"},
+                params={"project_id": project_id, "limit": "20"},
                 headers=headers, timeout=10,
             )
             if resp.status_code == 200:
