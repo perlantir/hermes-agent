@@ -124,7 +124,7 @@ def main() -> None:
         description="Talk to a persistent Hermes agent via HIPP0"
     )
     parser.add_argument(
-        "--agent", default="alice", help="Agent name (default: alice)"
+        "--agent", default="hipp0", help="Agent name (default: hipp0)"
     )
     args = parser.parse_args()
 
