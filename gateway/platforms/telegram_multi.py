@@ -49,6 +49,13 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    from telegram.ext import MessageReactionHandler
+    _MESSAGE_REACTION_HANDLER_AVAILABLE = True
+except ImportError:  # older python-telegram-bot
+    MessageReactionHandler = None  # type: ignore[assignment]
+    _MESSAGE_REACTION_HANDLER_AVAILABLE = False
+
 from hermes_cli.agent_registry import (
     AgentNotFoundError,
     AgentProfile,
@@ -191,6 +198,10 @@ class _Session:
     decision_count: int = 0
     last_activity: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Local SQLite session_id of the most recent agent turn. Outcome
+    # signals are recorded against this id (the AIAgent's session_id),
+    # not the HIPP0 ``session_id`` above — those live in different tables.
+    last_local_session_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +278,14 @@ class AgentBot:
             )
         )
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+        if _MESSAGE_REACTION_HANDLER_AVAILABLE:
+            try:
+                app.add_handler(MessageReactionHandler(self._handle_message_reaction))
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    "[%s] failed to register MessageReactionHandler: %s",
+                    self.agent_name, e,
+                )
         app.add_error_handler(self._on_error)
         self.app = app
         return app
@@ -351,6 +370,14 @@ class AgentBot:
             )
             return
 
+        # Implicit outcome signal: if this message reads as feedback on the
+        # previous exchange, stamp the prior session row before we start a
+        # new turn. Fire-and-forget — never block the message flow.
+        try:
+            self._maybe_record_implicit_outcome(session, user_text)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[%s] implicit outcome dispatch: %s", self.agent_name, exc)
+
         async with session.lock:
             session.last_activity = time.time()
             try:
@@ -360,6 +387,14 @@ class AgentBot:
                 await chat.send_message(f"{self.emoji} error: {e}")
                 return
             session.decision_count += 1
+            # Stash the AIAgent's current local session_id so the NEXT
+            # incoming message can attach an outcome signal to it.
+            try:
+                session.last_local_session_id = getattr(
+                    session.agent, "session_id", None
+                )
+            except Exception:
+                pass
 
         if not response:
             response = "(no response)"
@@ -374,6 +409,105 @@ class AgentBot:
             except TelegramError as e:
                 logger.warning("[%s] send failed: %s", self.agent_name, e)
                 break
+
+    # ----------------------- outcome signals -------------------------
+
+    # Telegram emoji → outcome polarity. Mirrors the map in
+    # gateway/platforms/telegram.py so reactions behave consistently
+    # across the single-bot and multi-bot adapters.
+    _REACTION_OUTCOME_MAP: Dict[str, str] = {
+        "\U0001f44d": "positive",   # 👍
+        "\u2764":     "positive",   # ❤
+        "\u2764\ufe0f": "positive", # ❤️ (with VS16)
+        "\U0001f525": "positive",   # 🔥
+        "\U0001f31f": "positive",   # 🌟
+        "\u2b50":     "positive",   # ⭐
+        "\U0001f44e": "negative",   # 👎
+        "\U0001f4a9": "negative",   # 💩
+        "\U0001f615": "negative",   # 😕
+        "\U0001f914": "negative",   # 🤔
+    }
+
+    def _maybe_record_implicit_outcome(
+        self, session: _Session, text: str
+    ) -> None:
+        if not text or not session.last_local_session_id:
+            return
+        from gateway.builtin_hooks.outcome_signals import detect_implicit_outcome
+        detected = detect_implicit_outcome([text], [])
+        if not detected:
+            return
+        outcome, source = detected
+        target_session_id = session.last_local_session_id
+        # Only signal once per agent turn — clear immediately so a follow-up
+        # "thanks again" doesn't double-stamp the same row.
+        session.last_local_session_id = None
+        note = text[:200]
+        asyncio.create_task(
+            self._record_outcome_async(target_session_id, outcome, source, note)
+        )
+
+    async def _record_outcome_async(
+        self,
+        session_id: str,
+        outcome: str,
+        signal_source: str,
+        note: Optional[str],
+    ) -> None:
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            detail = {"signal_source": signal_source, "note": note}
+            await asyncio.to_thread(
+                db.record_outcome, session_id, outcome, signal_source, detail
+            )
+            logger.info(
+                "[%s] outcome=%s recorded on session %s (source=%s)",
+                self.agent_name, outcome, session_id, signal_source,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.debug(
+                "[%s] record_outcome failed for %s: %s",
+                self.agent_name, session_id, exc,
+            )
+
+    async def _handle_message_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Fire-and-forget outcome signal from a Telegram reaction.
+
+        Note: Telegram's Bot API only delivers reaction updates in groups
+        and channels; reactions in 1:1 DMs are not delivered to bots.
+        """
+        try:
+            reaction_update = getattr(update, "message_reaction", None)
+            if reaction_update is None:
+                return
+            new_reactions = getattr(reaction_update, "new_reaction", None) or []
+            chat = getattr(reaction_update, "chat", None)
+            chat_id = chat.id if chat and chat.id is not None else None
+            if chat_id is None or not new_reactions:
+                return
+            outcome: Optional[str] = None
+            for r in new_reactions:
+                emoji = getattr(r, "emoji", None)
+                if emoji and emoji in self._REACTION_OUTCOME_MAP:
+                    outcome = self._REACTION_OUTCOME_MAP[emoji]
+                    break
+            if not outcome:
+                return
+            session = self.sessions.get(chat_id)
+            if session is None or not session.last_local_session_id:
+                return
+            target = session.last_local_session_id
+            session.last_local_session_id = None
+            asyncio.create_task(
+                self._record_outcome_async(
+                    target, outcome, "user_reaction", "telegram_reaction"
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[%s] reaction handler error: %s", self.agent_name, exc)
 
     # ------------------------- sessions ------------------------------
 
@@ -441,6 +575,7 @@ class AgentBot:
             skip_memory=False,
             slim_prompt=True,
             session_db=session_db,
+            agent_name=self.agent_name,
         )
 
         adapter = _Hipp0SyncAdapter(provider, self.main_loop)
