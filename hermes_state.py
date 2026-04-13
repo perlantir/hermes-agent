@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     outcome TEXT,
     outcome_source TEXT,
     outcome_detail TEXT,
+    agent_name TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -349,6 +350,22 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                # v8: add agent_name column to sessions — required so the
+                # reflection cron can filter sessions per persistent agent
+                # instead of pooling every agent's sessions together.
+                try:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN agent_name TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                try:
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_sessions_agent_name "
+                        "ON sessions(agent_name)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -381,13 +398,14 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        agent_name: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, started_at, agent_name)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -397,6 +415,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    agent_name,
                 ),
             )
         self._execute_write(_do)
@@ -539,6 +558,7 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        agent_name: str = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -549,10 +569,18 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, model, started_at, agent_name)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, model, time.time(), agent_name),
             )
+            if agent_name:
+                # If the row already existed with a NULL agent_name (e.g. created
+                # via a path that didn't know the agent yet), backfill it now.
+                conn.execute(
+                    "UPDATE sessions SET agent_name = ? "
+                    "WHERE id = ? AND agent_name IS NULL",
+                    (agent_name, session_id),
+                )
         self._execute_write(_do)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:

@@ -121,10 +121,12 @@ def _query_sessions(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Return sessions for *agent_name* in the lookback window, split by outcome.
 
-    Sessions are matched by source containing the agent name (e.g.
-    ``telegram:persistent:<agent>`` or ``cli:<agent>``). If no sessions match
-    by source, falls back to all sessions in the window (best-effort for
-    shared-source setups).
+    Sessions are filtered by the ``agent_name`` column (set when an
+    AIAgent is constructed for a persistent agent). Rows with a NULL
+    ``agent_name`` are legacy/cross-flow sessions written before this
+    column existed — we include them as a best-effort fallback so old
+    sessions still show up in every agent's reflection rather than
+    vanishing entirely.
     """
     cutoff = time.time() - lookback_days * 86400
     db_path = _state_db_path()
@@ -134,20 +136,16 @@ def _query_sessions(
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            """SELECT id, source, started_at, ended_at, message_count,
+            """SELECT id, source, agent_name, started_at, ended_at, message_count,
                       outcome, outcome_source, outcome_detail
                FROM sessions
                WHERE started_at >= ?
+                 AND (agent_name = ? OR agent_name IS NULL)
                ORDER BY started_at DESC
                LIMIT 500""",
-            (cutoff,),
+            (cutoff, agent_name),
         ).fetchall()
-        sessions = [dict(r) for r in rows]
-        agent_like = [
-            s for s in sessions
-            if s.get("source") and agent_name in str(s["source"])
-        ]
-        pool = agent_like or sessions
+        pool = [dict(r) for r in rows]
         # Attach the first user message as a summary
         for s in pool:
             msg_row = con.execute(
@@ -178,12 +176,12 @@ def _query_tool_usage(agent_name: str, lookback_days: int) -> Dict[str, int]:
             """SELECT m.tool_name, COUNT(*) as n
                FROM messages m JOIN sessions s ON m.session_id = s.id
                WHERE s.started_at >= ?
-                 AND s.source LIKE ?
+                 AND (s.agent_name = ? OR s.agent_name IS NULL)
                  AND m.tool_name IS NOT NULL
                GROUP BY m.tool_name
                ORDER BY n DESC
                LIMIT 50""",
-            (cutoff, f"%{agent_name}%"),
+            (cutoff, agent_name),
         ).fetchall()
         return {r[0]: int(r[1]) for r in rows}
     finally:

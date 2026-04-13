@@ -377,6 +377,7 @@ class _AgentSession:
             skip_memory=False,
             slim_prompt=True,
             session_db=session_db,
+            agent_name=self.agent_name,
         )
 
         # Wire HIPP0 as external memory provider

@@ -593,6 +593,7 @@ class AIAgent:
         slim_prompt: bool = False,
         session_db=None,
         parent_session_id: str = None,
+        agent_name: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -1074,6 +1075,7 @@ class AIAgent:
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
+        self._agent_name = agent_name
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -1088,6 +1090,7 @@ class AIAgent:
                     },
                     user_id=None,
                     parent_session_id=self._parent_session_id,
+                    agent_name=self._agent_name,
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
@@ -2110,6 +2113,7 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                agent_name=self._agent_name,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -6437,6 +6441,7 @@ class AIAgent:
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     parent_session_id=old_session_id,
+                    agent_name=self._agent_name,
                 )
                 # Auto-number the title for the continuation session
                 if old_title:

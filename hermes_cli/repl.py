@@ -365,6 +365,7 @@ def main() -> None:
         skip_memory=False,  # Enable builtin memory/user tools + memory manager
         slim_prompt=True,
         session_db=session_db,
+        agent_name=profile.name,
     )
 
     # ---- Wire HIPP0 as external memory provider ----
