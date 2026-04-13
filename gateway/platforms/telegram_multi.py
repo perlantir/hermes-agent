@@ -202,6 +202,10 @@ class _Session:
     # signals are recorded against this id (the AIAgent's session_id),
     # not the HIPP0 ``session_id`` above — those live in different tables.
     last_local_session_id: Optional[str] = None
+    # Multi-turn conversation history. ``AIAgent.chat()`` is amnesic — it
+    # calls ``run_conversation`` with no prior history — so we keep the
+    # ``messages`` list returned from each turn and feed it back in.
+    history: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -381,11 +385,24 @@ class AgentBot:
         async with session.lock:
             session.last_activity = time.time()
             try:
-                response = await asyncio.to_thread(session.agent.chat, user_text)
+                # Use run_conversation (not chat()) so we can carry the
+                # message history forward across turns. Without this the
+                # bot replies as if every message were the first.
+                history_in = list(session.history)
+                result = await asyncio.to_thread(
+                    session.agent.run_conversation,
+                    user_text,
+                    None,            # system_message — keep agent's ephemeral one
+                    history_in,      # conversation_history
+                )
             except Exception as e:
-                logger.exception("[%s] chat() failed: %s", self.agent_name, e)
+                logger.exception("[%s] run_conversation failed: %s", self.agent_name, e)
                 await chat.send_message(f"{self.emoji} error: {e}")
                 return
+            response = (result or {}).get("final_response") or ""
+            new_messages = (result or {}).get("messages")
+            if isinstance(new_messages, list):
+                session.history = new_messages
             session.decision_count += 1
             # Stash the AIAgent's current local session_id so the NEXT
             # incoming message can attach an outcome signal to it.
