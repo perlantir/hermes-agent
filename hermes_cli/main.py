@@ -2654,6 +2654,12 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_reflect(args):
+    """Self-reflection engine."""
+    from hermes_cli.reflect import reflect_command
+    reflect_command(args)
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -4701,6 +4707,38 @@ For more help on a command:
     cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
 
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # reflect command — self-improvement engine
+    # =========================================================================
+    reflect_parser = subparsers.add_parser(
+        "reflect",
+        help="Run / manage the self-reflection engine for an agent",
+        description=(
+            "Analyze recent agent sessions (outcomes, tool usage, memory) and "
+            "either propose improvements (default, dry-run) or apply them."
+        ),
+    )
+    reflect_parser.add_argument("agent", nargs="?", help="Agent name")
+    reflect_parser.add_argument(
+        "--apply", action="store_true", help="Apply approved changes",
+    )
+    reflect_parser.add_argument(
+        "--list", action="store_true",
+        help="Print the last 20 reflection_log entries for this agent",
+    )
+    reflect_parser.add_argument(
+        "--rollback", metavar="TIMESTAMP",
+        help="Roll back the change at the given timestamp",
+    )
+    reflect_parser.add_argument(
+        "--status", action="store_true",
+        help="Show reflection status across all agents",
+    )
+    reflect_parser.add_argument(
+        "--lookback", type=int, default=7, help="Lookback window in days",
+    )
+    reflect_parser.set_defaults(func=cmd_reflect)
 
     # =========================================================================
     # webhook command

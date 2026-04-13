@@ -3801,7 +3801,75 @@ class GatewayRunner:
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
 
+        try:
+            reflection_lines = self._build_reflection_status_block()
+            if reflection_lines:
+                lines.append("")
+                lines.extend(reflection_lines)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("status reflection block failed: %s", exc)
+
         return "\n".join(lines)
+
+    def _build_reflection_status_block(self) -> List[str]:
+        """Render a compact reflection summary across all persistent agents."""
+        try:
+            from hermes_cli.agent_registry import list_agents, get_agent_dir
+        except Exception:
+            return []
+        agents = list_agents()
+        if not agents:
+            return []
+        import json as _json
+        import time as _time
+        import sqlite3 as _sqlite3
+        from hermes_constants import get_hermes_home
+        last_run = None
+        applied = 0
+        pending = 0
+        for agent in agents:
+            log_path = get_agent_dir(agent) / "reflection_log.jsonl"
+            if not log_path.is_file():
+                continue
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    e = _json.loads(line)
+                except Exception:
+                    continue
+                ts = e.get("timestamp")
+                if ts and (last_run is None or ts > last_run):
+                    last_run = ts
+                if e.get("action", "").startswith("memory_") and e.get("applied"):
+                    applied += 1
+                if e.get("action") == "skill_proposal" and not e.get("applied"):
+                    pending += 1
+        cutoff = _time.time() - 7 * 86400
+        pos = neg = neu = 0
+        db_path = get_hermes_home() / "state.db"
+        if db_path.exists():
+            con = _sqlite3.connect(str(db_path))
+            try:
+                rows = con.execute(
+                    "SELECT outcome, COUNT(*) FROM sessions WHERE started_at >= ? GROUP BY outcome",
+                    (cutoff,),
+                ).fetchall()
+            finally:
+                con.close()
+            for outcome, n in rows:
+                if outcome == "positive":
+                    pos = int(n)
+                elif outcome == "negative":
+                    neg = int(n)
+                else:
+                    neu += int(n)
+        last_str = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(last_run)) if last_run else "never"
+        return [
+            "📊 **Self-Improvement:**",
+            f"Last reflection: {last_str}",
+            f"Changes last cycle: {applied} memory entries",
+            f"Pending proposals: {pending} skills",
+            f"Outcomes (7d): 👍 {pos} 👎 {neg} ⚪ {neu}",
+        ]
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
