@@ -623,6 +623,22 @@ DEFAULT_CONFIG = {
         "wrap_response": True,
     },
 
+    # Self-reflection engine — daily Haiku analysis per agent that
+    # proposes memory/skill improvements from recent session outcomes.
+    "reflection": {
+        "enabled": True,
+        "lookback_days": 7,
+        "auto_apply": True,
+        "thresholds": {
+            "memory_add": 0.5,
+            "memory_replace": 0.7,
+            "skill_create": 1.0,
+            "cross_agent": 0.6,
+        },
+        "max_memory_per_cycle": 3,
+        "max_skills_per_cycle": 0,
+    },
+
     # Logging — controls file logging to ~/.hermes/logs/.
     # agent.log captures INFO+ (all agent activity); errors.log captures WARNING+.
     "logging": {

@@ -562,8 +562,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    # Reflection jobs bypass the full AIAgent runtime — they run the
+    # reflection engine directly via its own Haiku call.
+    if job.get("job_type") == "reflection":
+        from cron.reflection import run_reflection_job
+        result = run_reflection_job(job)
+        summary = json.dumps(result, indent=2)
+        ok = bool(result.get("ok"))
+        return (ok, summary, summary, None if ok else result.get("error"))
+
     from run_agent import AIAgent
-    
+
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
