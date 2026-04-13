@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    outcome TEXT,
+    outcome_source TEXT,
+    outcome_detail TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -329,6 +332,23 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add outcome tracking columns to sessions — for
+                # self-improvement signal collection (Telegram reactions +
+                # implicit regex detection).
+                for col_name, col_type in [
+                    ("outcome", "TEXT"),
+                    ("outcome_source", "TEXT"),
+                    ("outcome_detail", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -397,6 +417,21 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
+            )
+        self._execute_write(_do)
+
+    def record_outcome(
+        self,
+        session_id: str,
+        outcome: str,
+        source: str,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record an outcome signal on a session. Fire-and-forget friendly."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET outcome = ?, outcome_source = ?, outcome_detail = ? WHERE id = ?",
+                (outcome, source, json.dumps(detail) if detail else None, session_id),
             )
         self._execute_write(_do)
 

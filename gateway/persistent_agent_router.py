@@ -75,6 +75,10 @@ class _ChatState:
     sticky_agent: Optional[str] = None
     session_id_by_agent: Dict[str, str] = field(default_factory=dict)
     last_activity: float = 0.0
+    # Most-recent exchange for outcome signal collection
+    last_session_id: Optional[str] = None
+    last_agent_name: Optional[str] = None
+    last_snippet_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -323,6 +327,16 @@ class PersistentAgentRouter:
 
         state.session_id_by_agent[agent_name] = result.session_id
         state.last_activity = self._clock()
+        # Stash last-exchange context for outcome signal collection
+        state.last_session_id = result.session_id
+        state.last_agent_name = agent_name
+        snippet_ids: List[str] = []
+        captured = getattr(result, "captured", None) or {}
+        for key in ("snippet_ids", "summary_snippet_ids", "decision_ids"):
+            val = captured.get(key) if isinstance(captured, dict) else None
+            if isinstance(val, list):
+                snippet_ids.extend(str(s) for s in val)
+        state.last_snippet_ids = snippet_ids
         return result
 
     # ---------------------------------------------------------------- utils
@@ -332,6 +346,72 @@ class PersistentAgentRouter:
     ) -> Optional[str]:
         """Return the cached HIPP0 session id for a chat/agent pair."""
         return self._get_state(chat_id).session_id_by_agent.get(agent_name)
+
+    def get_last_exchange(
+        self, chat_id: str
+    ) -> Optional[Tuple[str, str, List[str]]]:
+        """Return (agent_name, session_id, snippet_ids) for the most recent
+        persistent-agent exchange in *chat_id*, or ``None`` if none."""
+        state = self._state.get(chat_id)
+        if not state or not state.last_session_id or not state.last_agent_name:
+            return None
+        return (
+            state.last_agent_name,
+            state.last_session_id,
+            list(state.last_snippet_ids),
+        )
+
+    async def record_outcome_for_last_exchange(
+        self,
+        chat_id: str,
+        outcome: str,
+        *,
+        signal_source: str,
+        note: Optional[str] = None,
+    ) -> bool:
+        """Record an outcome for the most-recent exchange in *chat_id*.
+
+        Fire-and-forget friendly: returns True on success, False if there
+        is nothing to record. Dual-writes to HIPP0 (via the agent's memory
+        provider) and to the local SQLite sessions table.
+        """
+        last = self.get_last_exchange(chat_id)
+        if not last:
+            return False
+        agent_name, session_id, snippet_ids = last
+        # Local SQLite update (best-effort, fire-and-forget semantics)
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            detail = {
+                "signal_source": signal_source,
+                "snippet_ids": snippet_ids,
+                "note": note,
+            }
+            db.record_outcome(session_id, outcome, signal_source, detail=detail)
+        except Exception as exc:  # pragma: no cover - never block the caller
+            logger.debug("local outcome write failed: %s", exc)
+        # HIPP0 update (only if we have snippet_ids — the provider no-ops
+        # otherwise, but we also skip instantiating the provider to save work)
+        if snippet_ids:
+            try:
+                from hermes_cli.agent_registry import get_agent
+                profile = get_agent(agent_name)
+                tool = self._tool_factory()
+                provider = tool._make_provider(profile)
+                try:
+                    provider._session_id = session_id
+                    await provider.record_outcome(
+                        snippet_ids,
+                        outcome,
+                        signal_source=signal_source,
+                        note=note,
+                    )
+                finally:
+                    await provider.aclose()
+            except Exception as exc:  # pragma: no cover
+                logger.debug("hipp0 record_outcome failed: %s", exc)
+        return True
 
     def forget_chat(self, chat_id: str) -> None:
         """Drop all state for *chat_id* (used when a chat ends / resets)."""

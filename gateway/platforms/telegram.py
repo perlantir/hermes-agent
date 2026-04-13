@@ -26,6 +26,12 @@ try:
         ContextTypes,
         filters,
     )
+    try:
+        from telegram.ext import MessageReactionHandler
+        MESSAGE_REACTION_HANDLER_AVAILABLE = True
+    except ImportError:
+        MessageReactionHandler = None
+        MESSAGE_REACTION_HANDLER_AVAILABLE = False
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -40,6 +46,8 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    MessageReactionHandler = None
+    MESSAGE_REACTION_HANDLER_AVAILABLE = False
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -613,6 +621,12 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Message reaction handler for outcome signal collection.
+            if MESSAGE_REACTION_HANDLER_AVAILABLE and MessageReactionHandler is not None:
+                try:
+                    self._app.add_handler(MessageReactionHandler(self._handle_message_reaction))
+                except Exception as exc:
+                    logger.debug("[%s] MessageReactionHandler registration failed: %s", self.name, exc)
             
             # Start polling — retry initialize() for transient TLS resets
             try:
@@ -1430,6 +1444,56 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
+
+    # ── Outcome signal: Telegram reactions ─────────────────────────────
+    # Maps emoji reactions to outcome labels for self-improvement signals.
+    _REACTION_OUTCOME_MAP = {
+        "\U0001f44d": "positive",  # thumbs up
+        "\u2764":      "positive",  # red heart
+        "\u2764\ufe0f": "positive",  # red heart (VS16)
+        "\U0001f525": "positive",  # fire
+        "\U0001f31f": "positive",  # glowing star
+        "\u2b50":      "positive",  # star
+        "\U0001f44e": "negative",  # thumbs down
+        "\U0001f4a9": "negative",  # poop
+        "\U0001f615": "negative",  # confused
+        "\U0001f914": "negative",  # thinking (close enough to confused)
+    }
+
+    async def _handle_message_reaction(
+        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+    ) -> None:
+        """Fire-and-forget outcome signal from a Telegram reaction."""
+        try:
+            reaction_update = getattr(update, "message_reaction", None)
+            if reaction_update is None:
+                return
+            new_reactions = getattr(reaction_update, "new_reaction", None) or []
+            chat = getattr(reaction_update, "chat", None)
+            chat_id = str(chat.id) if chat and chat.id is not None else None
+            if not chat_id or not new_reactions:
+                return
+            outcome: Optional[str] = None
+            matched_emoji: Optional[str] = None
+            for r in new_reactions:
+                emoji = getattr(r, "emoji", None)
+                if emoji and emoji in self._REACTION_OUTCOME_MAP:
+                    outcome = self._REACTION_OUTCOME_MAP[emoji]
+                    matched_emoji = emoji
+                    break
+            if not outcome:
+                return
+            router = self._persistent_agent_router()
+            if router is None:
+                return
+            await router.record_outcome_for_last_exchange(
+                chat_id,
+                outcome,
+                signal_source="user_reaction",
+                note=f"telegram_reaction:{matched_emoji}",
+            )
+        except Exception as exc:
+            logger.debug("[%s] reaction handler error: %s", self.name, exc)
 
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
@@ -2253,8 +2317,39 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(update.message, MessageType.TEXT)
         event.text = self._clean_bot_trigger_text(event.text)
+        # Implicit outcome signal — regex-only, fire-and-forget.
+        try:
+            chat_id = str(update.message.chat_id) if update.message else ""
+            if chat_id and event.text:
+                self._fire_implicit_outcome(chat_id, event.text)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[%s] implicit outcome dispatch: %s", self.name, exc)
         self._enqueue_text_event(event)
-    
+
+    def _fire_implicit_outcome(self, chat_id: str, text: str) -> None:
+        """Detect an implicit outcome from *text* about the prior exchange
+        in *chat_id*, and record it without blocking the message flow."""
+        try:
+            from gateway.builtin_hooks.outcome_signals import detect_implicit_outcome
+            detected = detect_implicit_outcome([text], [])
+            if not detected:
+                return
+            outcome, source = detected
+            router = self._persistent_agent_router()
+            if router is None:
+                return
+            import asyncio
+            asyncio.create_task(
+                router.record_outcome_for_last_exchange(
+                    chat_id,
+                    outcome,
+                    signal_source=source,
+                    note=text[:200],
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[%s] implicit outcome error: %s", self.name, exc)
+
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
